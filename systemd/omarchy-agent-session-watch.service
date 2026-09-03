@@ -1,0 +1,34 @@
+# omarchy-agent-session-watch.service (Agent Sessions for Omarchy, omarchy-multiplayer)
+#
+# Tails every session's events.jsonl and turns the notify-worthy changes into
+# Omarchy notifications (spec/06-notifications.md); runs the reconciler on a
+# five-second poll and on every Herdr event. Shape copied from the real
+# omarchy-crash-watch.service on quattro (PartOf/After graphical-session,
+# Type=simple, Restart=always) with these deviations, each checked on the
+# rig 2026-09-02:
+#
+#   - ExecStart is the per-user path install.sh links, not /usr/bin.
+#   - RestartSec=2 rather than crash-watch's 5: the watcher has run under
+#     this unit for a day of reboots and restarts without a crash loop.
+#   - No ConditionEnvironment=WAYLAND_DISPLAY: the watcher reads hyprctl for
+#     the fullscreen quiet rule and self-suppression, and degrades to plain
+#     notifications when there is no compositor; the unit is PartOf the
+#     graphical session anyway.
+#
+# The Herdr socket and the sessions directory default to
+# ~/.config/herdr/herdr.sock and ~/.local/state/omarchy/sessions; override
+# with a drop-in setting HERDR_SOCKET or OMARCHY_SESSIONS_DIR.
+
+[Unit]
+Description=Notify on agent session state changes needing attention
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omarchy-agent-session-watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

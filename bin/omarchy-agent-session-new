@@ -1,0 +1,9 @@
+#!/bin/bash
+
+# omarchy:summary=Create a new agent session and start its harness
+# omarchy:args=--agent <kind> [--mode personal|shared|restricted] [--name <text>] [--goal <text>] [--worktree <ref>] [--cwd <path>] [--owner <actor>] [-- <agent args>]
+# omarchy:examples=omarchy agent session new --agent claude --mode personal --name api-refactor
+
+set -euo pipefail
+
+exec omarchy-agent-session-core new "$@"

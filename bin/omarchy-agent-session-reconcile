@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# omarchy:summary=Reconcile session records against live Herdr panes
+# omarchy:args=[--json]
+# omarchy:examples=omarchy agent session reconcile --json
+
+set -euo pipefail
+
+# The command the panel-refresh and timer paths call; not a second mechanism.
+# Marks a bound session orphaned when its pane is gone, and adopts a live
+# Herdr agent pane with no matching session as one created by system:omarchy
+# (spec/02-command-surface.md).
+exec omarchy-agent-session-core reconcile "$@"

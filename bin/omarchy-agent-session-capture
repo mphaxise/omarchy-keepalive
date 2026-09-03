@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# omarchy:summary=Attach a screenshot, file, or URL artifact to a session
+# omarchy:args=<id-or-name> (--screenshot | --file <path> | --url <url>) [--label <text>]
+# omarchy:examples=omarchy agent session capture api-refactor --screenshot --label before
+
+set -euo pipefail
+
+# --screenshot shells out to the compositor's screenshot tool and saves the
+# PNG under artifacts/; --file copies a given file in; --url writes the link
+# as a one-line file, so `path` is always a real file either way
+# (spec/02-command-surface.md). Note: spec/05-receipts-and-artifacts.md
+# describes the underlying capture as `capture window` / `capture region`
+# against `omarchy capture screenshot`, a finer distinction than this
+# --screenshot flag; which one --screenshot maps to is core's decision
+# (verify on rig, see README-shell.md).
+exec omarchy-agent-session-core capture "$@"

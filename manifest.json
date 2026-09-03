@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mphaxise.keepalive",
+  "name": "Keepalive",
+  "version": "0.1.0",
+  "author": "Praneet Koppula",
+  "license": "MIT",
+  "description": "Keepalive: coding agents that stay running on the desktop as named omarchy-agent-session records. The bar shows who needs you, who is working, what finished today, and what got orphaned.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Keepalive",
+    "description": "One bar icon and one panel: sessions that need you, sessions working, sessions done today, and orphaned sessions.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10,
+      "showWhenEmpty": false,
+      "maxRows": 20,
+      "doneRowsCollapsed": 2,
+      "motion": "full",
+      "newSessionDir": "~/Work",
+      "newSessionMode": "personal"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 10
+      },
+      {
+        "key": "showWhenEmpty",
+        "type": "boolean",
+        "label": "Show when empty",
+        "defaultValue": false
+      },
+      {
+        "key": "maxRows",
+        "type": "integer",
+        "label": "Maximum rows",
+        "min": 5,
+        "max": 50,
+        "step": 1,
+        "defaultValue": 20
+      },
+      {
+        "key": "doneRowsCollapsed",
+        "type": "integer",
+        "label": "Done today rows shown until expanded",
+        "min": 0,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 2
+      },
+      {
+        "key": "motion",
+        "type": "string",
+        "label": "Motion (full or reduced)",
+        "defaultValue": "full"
+      },
+      {
+        "key": "newSessionDir",
+        "type": "string",
+        "label": "New sessions start in this directory",
+        "defaultValue": "~/Work"
+      },
+      {
+        "key": "newSessionMode",
+        "type": "string",
+        "label": "New sessions' permission mode (personal, shared, restricted)",
+        "defaultValue": "personal"
+      }
+    ]
+  }
+}

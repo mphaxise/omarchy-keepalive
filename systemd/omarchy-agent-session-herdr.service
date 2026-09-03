@@ -1,0 +1,21 @@
+# omarchy-agent-session-herdr.service (Agent Sessions for Omarchy, omarchy-multiplayer)
+#
+# Keeps Herdr's server running headless for the whole graphical session, so
+# agent sessions survive every client window closing and come back as
+# `orphaned` records after a reboot instead of vanishing (rig, 2026-09-02:
+# after a restart the server was down, the panel showed a stale idle row,
+# and Enter had nothing to attach to). Herdr's own client starts the server
+# on demand; this unit removes the dependency on someone opening a client.
+[Unit]
+Description=Herdr server for Omarchy agent sessions
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/herdr server
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

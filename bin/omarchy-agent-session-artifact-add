@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# omarchy:summary=Attach an artifact of any kind to a session
+# omarchy:args=<id-or-name> --kind capture|file|url|note --source <path|url|text> [--label <text>]
+# omarchy:examples=omarchy agent session artifact add api-refactor --kind url --source https://example.com/design --label design-link
+
+set -euo pipefail
+
+# Defined in spec/05-receipts-and-artifacts.md and spec/09-closed-loop-surfaces.md,
+# not spec/02-command-surface.md, which only lists this command in its
+# "Commands defined in other spec files" table. A url artifact fetches the
+# page title as the default label when none is given; a note stores the given
+# text verbatim; neither needs the compositor. The example above is
+# synthesized from those two files' prose usage, since neither gives a
+# verbatim "Example:" line for this command.
+exec omarchy-agent-session-core artifact-add "$@"

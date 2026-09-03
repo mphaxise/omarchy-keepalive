@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# omarchy:summary=Change a running session's permission mode
+# omarchy:args=<id-or-name> personal|shared|restricted
+# omarchy:examples=omarchy agent session mode api-refactor shared
+
+set -euo pipefail
+
+# Defined in spec/04-permission-modes.md, not spec/02-command-surface.md.
+# Stops the harness, relaunches it with the new mode's flags, and passes
+# harness_session_ref to the harness's own resume mechanism so the
+# conversation carries over; writes mode.changed. The example above is
+# synthesized: 04-permission-modes.md gives no verbatim "Example:" line for
+# this command.
+exec omarchy-agent-session-core mode "$@"

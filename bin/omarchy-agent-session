@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# omarchy:summary=Manage durable agent sessions: create, list, attach, and control them
+# omarchy:args=<subcommand> [args...]
+# omarchy:examples=omarchy agent session list --json | omarchy agent session new --agent claude --mode personal --name api-refactor
+
+set -euo pipefail
+
+# Omarchy resolves "omarchy agent session <subcommand>" to the sibling binary
+# omarchy-agent-session-<subcommand> directly, so this script only runs when
+# invoked bare, with no subcommand Omarchy could resolve. Kept minimal: print
+# usage and exit with the shared usage-error code (2), same as every
+# subcommand's own exit-code table (spec/02-command-surface.md).
+cat >&2 <<'USAGE'
+Usage: omarchy agent session <subcommand> [args...]
+
+Subcommands:
+  new           create a session and start its harness
+  list          list sessions from local records
+  show          show one session's record (--loop for its closed-loop history)
+  open          attach a terminal to a session
+  send          queue or deliver an instruction
+  stop          stop a session and, by default, its children
+  rename        rename a session
+  assign        reassign a session's owner
+  goal          set, clear, or show a session's durable goal
+  log           print or follow a session's event log
+  receipt       print a session's receipt
+  capture       attach a screenshot, file, or URL artifact
+  artifact-add  attach an artifact of any kind
+  preview       register the running product a session works on
+  mode          change a running session's permission mode
+  done          close a session's loop with a verdict
+  reconcile     reconcile session records against live Herdr panes
+
+Each subcommand is also its own command, e.g. "omarchy agent session new ...".
+Run one with no arguments (where it takes an id) to see its own usage.
+USAGE
+
+exit 2

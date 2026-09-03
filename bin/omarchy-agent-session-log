@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# omarchy:summary=Print or follow a session's event log
+# omarchy:args=<id-or-name> [--since <seq>] [--type <event-type>] [--follow] [--json] [--transcript <n>]
+# omarchy:examples=omarchy agent session log api-refactor --follow
+
+set -euo pipefail
+
+# --transcript <n> calls Herdr's agent.read and only succeeds once the session
+# is idle or done; it returns agent_not_idle while working/blocked/unknown for
+# a full-screen harness (spec/02-command-surface.md; verify on rig how often
+# that matters in practice).
+exec omarchy-agent-session-core log "$@"

@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# omarchy:summary=Register the running product a session works on
+# omarchy:args=<id-or-name> <url|app-id>
+# omarchy:examples=omarchy agent session preview api-refactor http://localhost:3000
+
+set -euo pipefail
+
+# Defined in spec/09-closed-loop-surfaces.md, not spec/02-command-surface.md.
+# `session open` then focuses this preview alongside attaching the terminal,
+# and `capture` defaults to it as the capture target. The example above is
+# synthesized: 09-closed-loop-surfaces.md describes the behavior but gives no
+# verbatim "Example:" line for this command.
+exec omarchy-agent-session-core preview "$@"

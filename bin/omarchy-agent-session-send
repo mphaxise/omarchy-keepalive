@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# omarchy:summary=Queue or deliver an instruction to a session
+# omarchy:args=<id-or-name> <text> [--from <origin-id>] [--about <artifact-id>] [--wait] [--until <state>]... [--timeout <ms>]
+# omarchy:examples=omarchy agent session send api-refactor "add a regression test" --wait --until done
+
+set -euo pipefail
+
+# --from <origin-id> marks another session, not a human, as author: delivery
+# prefixes the instruction with the fixed
+# "[omarchy-session-message from=... name=...]" marker line
+# (spec/02-command-surface.md). --about <artifact-id> ties the instruction to
+# the capture or note it responds to (spec/09-closed-loop-surfaces.md); both
+# forms share this one binary.
+exec omarchy-agent-session-core send "$@"

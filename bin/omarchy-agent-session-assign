@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# omarchy:summary=Reassign a session's owner
+# omarchy:args=<id-or-name> <owner-actor>
+# omarchy:examples=omarchy agent session assign api-refactor human:praneet@rig
+
+set -euo pipefail
+
+# Ownership is responsibility, not access, so there is nothing for Herdr to do
+# here (spec/02-command-surface.md).
+exec omarchy-agent-session-core assign "$@"

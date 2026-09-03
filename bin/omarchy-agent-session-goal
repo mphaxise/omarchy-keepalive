@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# omarchy:summary=Set, clear, or show a session's durable goal
+# omarchy:args=<id-or-name> (set <text> | clear | show)
+# omarchy:examples=omarchy agent session goal api-refactor set "ship the v2 auth endpoint"
+
+set -euo pipefail
+
+# set/clear both write goal.set; the session model defines only that one event
+# type, so clear writes it with text empty rather than a new event type
+# (spec/02-command-surface.md). show writes nothing.
+exec omarchy-agent-session-core goal "$@"

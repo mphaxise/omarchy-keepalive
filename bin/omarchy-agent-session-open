@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# omarchy:summary=Attach a terminal to a session, resuming or starting its harness
+# omarchy:args=<id-or-name>
+# omarchy:examples=omarchy agent session open api-refactor
+
+set -euo pipefail
+
+# Bound and live: focuses a terminal at app id org.omarchy.session.<id>.
+# Orphaned with a harness_session_ref: resumes the harness in the same
+# worktree with that kind's native resume flag, then attaches. Orphaned with
+# no ref: starts fresh in the same worktree (spec/02-command-surface.md).
+exec omarchy-agent-session-core open "$@"

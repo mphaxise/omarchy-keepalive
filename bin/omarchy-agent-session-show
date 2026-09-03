@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# omarchy:summary=Show one session's record, or its closed-loop history with --loop
+# omarchy:args=<id-or-name> [--refresh] [--json] [--loop]
+# omarchy:examples=omarchy agent session show api-refactor --refresh | omarchy agent session show api-refactor --loop
+
+set -euo pipefail
+
+# --loop is defined in spec/09-closed-loop-surfaces.md, not 02-command-surface.md:
+# it renders intent, instructions, changes, and captures in order, writing
+# nothing. --refresh (02-command-surface.md) writes status.changed only when
+# live state disagrees with the record.
+exec omarchy-agent-session-core show "$@"

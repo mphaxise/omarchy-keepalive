@@ -1,0 +1,785 @@
+#!/usr/bin/env python3
+"""omarchy-agent-session-watch
+
+Proposed for omarchy-multiplayer, 2026-09-01. Implements spec/06-notifications.md:
+a user daemon that tails every agent session's events.jsonl under
+OMARCHY_SESSIONS_DIR (default ~/.local/state/omarchy/sessions/), decides which
+events are notify-worthy, and calls omarchy-notification-send for them, with
+coalescing, self-suppression, a fullscreen quiet hold, and a digest for bursts.
+
+Standard library only. See README-shell.md, next to this file's build tree,
+for what is verified locally versus VERIFY ON RIG.
+
+Usage:
+  omarchy-agent-session-watch                 run the watch loop
+  omarchy-agent-session-watch --dry-run       print notification argv instead
+                                               of calling omarchy-notification-send
+  omarchy-agent-session-watch --once          one scan pass, then exit
+                                               (not in the spec; added for
+                                               manual testing without Omarchy)
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import dataclasses
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import shutil
+import threading
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+CURSOR_FILENAME = ".watch-cursors.json"
+COALESCE_WINDOW_S = 10.0
+DIGEST_WINDOW_S = 60.0
+DIGEST_THRESHOLD = 3  # the 4th notify-worthy event in the window triggers a digest
+
+APP_ID_PREFIX = "org.omarchy.session."
+
+# --- event classification -----------------------------------------------
+#
+# spec/06-notifications.md's table, plus one reconciliation with
+# spec/01-session-model.md: the spec's table lists a "session.orphaned" row,
+# but 01-session-model.md's event-type table has no such type -- orphaning is
+# a status.changed event with data.to == "orphaned" (state machine: "any live
+# -> orphaned, trigger: Herdr pane gone with no exit event, source:
+# reconciler"; 02-command-surface.md's `reconcile` command: "Writes
+# status.changed to orphaned and runtime.unbound"). Treated as a
+# status.changed variant here, not a separate event type. Flagged in
+# README-shell.md.
+
+_STATUS_TO_KIND = {
+    "waiting": ("waiting", "normal"),
+    "blocked": ("blocked", "normal"),
+    "done": ("done", "low"),
+    "failed": ("failed", "critical"),
+    # orphaned: decided in classify_event, not here, because its urgency
+    # depends on the event's data.detail (see HERDR_DOWN_DETAIL).
+    # working, idle, starting, stopped: no notification (spec's table lists
+    # working/idle explicitly as "no"; starting/stopped are unlisted, treated
+    # the same way: nothing not explicitly named in the table notifies).
+}
+
+# The reconciler's detail string when Herdr itself is unreachable
+# (omarchy-agent-session-core, cmd_reconcile on HerdrUnavailable: typically
+# right after a reboot). Every bound session is orphaned at once and the
+# panel carries a Herdr-down row for the outage, so those notices go out at
+# normal, not critical -- otherwise clearing the corner means relaunching
+# every agent (live desktop, 2026-09-02). Any other detail ("pane not found
+# in Herdr's list") means one agent died behind the person's back and stays
+# critical. Matched exactly, as written by the core.
+HERDR_DOWN_DETAIL = "Herdr server not running"
+# The reconciler's detail when Herdr came back after a restart (a reboot,
+# above all) and restored the session's workspace without its agent: every
+# bound session is orphaned at once, revivable, expected. Normal, like the
+# outage itself (rig, 2026-09-02 22:30).
+HERDR_RESTARTED_DETAIL = "Herdr restarted; Enter revives"
+EXPECTED_ORPHAN_DETAILS = (HERDR_DOWN_DETAIL, HERDR_RESTARTED_DETAIL)
+
+# Mirrors the core's TERMINAL_STATES: a session in one of these has no pane
+# to attach, so `open` exits 5 and a click on it would do nothing.
+TERMINAL_STATES = {"done", "failed", "stopped"}
+
+RECEIPT_APP_ID = "org.omarchy.session-receipt"
+
+
+def classify_event(event: dict) -> Optional[tuple]:
+    """Return (kind, urgency) for a notify-worthy event, else None.
+
+    `kind` is the short tag used for text templates and digest tallies:
+    waiting, blocked, done, failed, orphaned, child_completed.
+    """
+    etype = event.get("type")
+    data = event.get("data") or {}
+    if etype == "status.changed":
+        to_state = data.get("to")
+        if to_state == "orphaned":
+            urgency = "normal" if data.get("detail") in EXPECTED_ORPHAN_DETAILS else "critical"
+            return ("orphaned", urgency)
+        return _STATUS_TO_KIND.get(to_state)
+    if etype == "child.completed":
+        return ("child_completed", "low")
+    # instruction.delivered (spec's table says "no" explicitly) and every
+    # other event type in 01-session-model.md's list: no notification.
+    return None
+
+
+def render_text(kind: str, record: dict, event: dict, lookup_name: Callable[[str], Optional[str]]) -> str:
+    """The title templates from spec/06-notifications.md's table.
+
+    Revised after the live-desktop review (2026-09-02): Herdr reports a
+    question and a permission prompt both as `blocked`, so "needs approval"
+    was a guess that was wrong whenever the agent had asked a question;
+    waiting and blocked now share one title while staying distinct kinds
+    internally. failed's detail moved into the body to keep the title short.
+    "lost its pane" was Herdr vocabulary that read as the window the person
+    closed on purpose.
+    """
+    name = record.get("name") or record.get("id") or "session"
+    data = event.get("data") or {}
+    if kind in ("waiting", "blocked"):
+        return f"{name} needs you"
+    if kind == "done":
+        return f"{name} finished"
+    if kind == "failed":
+        return f"{name} failed"
+    if kind == "orphaned":
+        return f"{name} stopped unexpectedly"
+    if kind == "child_completed":
+        child_id = data.get("child_id", "")
+        # ASSUMPTION: child.completed lives on the *parent's* events.jsonl
+        # (01-session-model.md: "the parent records the child in
+        # lineage.children and receives a child.completed event"), so `name`
+        # above is already the parent. Click target and self-suppression both
+        # use the parent session id too (see SessionWatcher._handle_event);
+        # neither spec file states this explicitly. Flagged in README-shell.md.
+        child_name = lookup_name(child_id) or child_id or "child session"
+        state = data.get("state", "")
+        return f"{name}: {child_name} finished ({state})"
+    return f"{name}: {kind}"
+
+
+def has_resume_ref(record: dict) -> bool:
+    """True when `open` would resume the harness's own transcript rather
+    than start fresh. Same test the core's cmd_open applies to
+    agent.harness_session_ref (a plain truthiness check), narrowed to
+    strings so a malformed record never promises a resume."""
+    ref = (record.get("agent") or {}).get("harness_session_ref")
+    return isinstance(ref, str) and bool(ref)
+
+
+def render_body(kind: str, record: dict, event: Optional[dict] = None) -> str:
+    """Second line under the headline: what the session is for and what a
+    click does, so the toast reads like the crash toast ("Click to diagnose
+    with AI") instead of a bare name. The action names exactly what the
+    click_argv for this kind runs, so the words never promise a click that
+    does nothing (live desktop, 2026-09-02)."""
+    agent = ((record.get("agent") or {}).get("kind") or "agent")
+    data = (event or {}).get("data") or {}
+    if kind == "failed":
+        # The failure detail replaces the goal/branch here: it is what the
+        # person needs to read, and it no longer fits in the title.
+        detail_lines = (data.get("detail") or "").strip().splitlines()
+        detail = detail_lines[0] if detail_lines else "unknown error"
+        return f"{agent} · {detail} · Click to open the receipt"
+    goal = record.get("goal") or {}
+    goal_text = (goal.get("text") if isinstance(goal, dict) else None) or ""
+    goal_text = goal_text.strip().splitlines()[0] if goal_text.strip() else ""
+    branch = (record.get("workspace") or {}).get("branch") or ""
+    what = goal_text or branch or ""
+    if kind in ("waiting", "blocked"):
+        action = "Click to open and answer"
+    elif kind == "done":
+        action = "Click to open the receipt"
+    elif kind == "orphaned":
+        # Says up front whether the revive picks the conversation back up or
+        # starts over, since that is the difference the person cares about.
+        if has_resume_ref(record):
+            action = "Click to revive, same conversation"
+        else:
+            action = "Click to revive, fresh conversation"
+    else:
+        action = "Click to open"
+    head = f"{agent} · {what}" if what else agent
+    return f"{head} · {action}"
+
+
+def click_argv(kind: str, session_id: str, record: dict) -> list:
+    """What a click on the toast runs.
+
+    A session in a terminal state has no pane to attach, so
+    `omarchy-agent-session-open` exits 5 and the click does nothing (live
+    desktop, 2026-09-02): done and failed notices, and any notice for a
+    session whose record already shows a terminal state (an event read late,
+    after the session ended), open the receipt in a pager instead. Every
+    other notice opens the session -- or, for orphaned, revives it. The
+    `--pager` flag on `receipt` lands in a parallel core change.
+    """
+    state = (record.get("status") or {}).get("state")
+    if kind in ("done", "failed") or state in TERMINAL_STATES:
+        return [
+            "omarchy-launch-tui",
+            f"--app-id={RECEIPT_APP_ID}",
+            "omarchy-agent-session-receipt",
+            "--pager",
+            session_id,
+        ]
+    # The click runs the real binary; the bare `omarchy-agent-session`
+    # group script only prints usage (rig, 2026-09-02).
+    return ["omarchy-agent-session-open", session_id]
+
+
+SESSION_GLYPH = "\U000f06a9"  # nf-md-robot, the glyph the sessions widget uses
+
+
+_DIGEST_LABELS = {
+    "waiting": "waiting",
+    "blocked": "blocked",
+    "done": "done",
+    "failed": "failed",
+    "orphaned": "orphaned",
+    "child_completed": "child done",
+}
+_DIGEST_ORDER = ["waiting", "blocked", "done", "failed", "orphaned", "child_completed"]
+
+
+# --- omarchy-notification-send -------------------------------------------
+
+
+class Notifier:
+    """Wraps omarchy-notification-send, or records what would be sent.
+
+    Confirmed against the real bin/omarchy-notification-send source
+    (omacom/omarchy, branch quattro, fetched 2026-09-01): --urgency accepts
+    low|normal|critical; -r/--replace-id <id> and -p/--print-id exist and are
+    what this class uses to implement coalescing via Notify's replaces_id, the
+    mechanism spec/06-notifications.md names while marking which tool exposes
+    it "verify on rig" -- that part is now confirmed at the source level.
+    Whether the rig's notification daemon actually updates the toast in place
+    when replaces_id is set stays VERIFY ON RIG; this class only confirms the
+    flags exist and are wired correctly.
+    """
+
+    def __init__(self, dry_run: bool = False, runner: Optional[Callable] = None):
+        self.dry_run = dry_run
+        self._runner = runner or subprocess.run
+        self.sent: list[dict] = []  # every call this instance has made or dry-run printed
+        self._next_fake_id = 1000  # dry-run only: lets coalescing logic still chain ids
+
+    def send(
+        self,
+        headline: str,
+        description: str = "",
+        urgency: str = "normal",
+        exec_argv: Optional[list] = None,
+        replaces_id: Optional[int] = None,
+        print_id: bool = True,
+    ) -> Optional[int]:
+        # Same shape as omarchy-crash-watch's call: urgency, a glyph, a
+        # headline, a body, then --exec last (rig, 2026-09-02).
+        argv = ["omarchy-notification-send", "--urgency", urgency, "--glyph", SESSION_GLYPH]
+        if replaces_id is not None:
+            argv += ["--replace-id", str(replaces_id)]
+        if print_id:
+            argv.append("--print-id")
+        argv.append(headline)
+        if description:
+            argv.append(description)
+        if exec_argv:
+            argv.append("--exec")
+            argv.extend(exec_argv)
+
+        record = {
+            "argv": argv,
+            "headline": headline,
+            "description": description,
+            "urgency": urgency,
+            "exec_argv": exec_argv,
+            "replaces_id": replaces_id,
+        }
+        self.sent.append(record)
+
+        if self.dry_run:
+            print(" ".join(shlex.quote(a) for a in argv))
+            fake_id = self._next_fake_id
+            self._next_fake_id += 1
+            record["id"] = fake_id
+            return fake_id
+
+        try:
+            result = self._runner(argv, capture_output=True, text=True, timeout=5, check=False)
+        except Exception as exc:  # never let a notify failure take the daemon down
+            print(f"omarchy-agent-session-watch: notification send failed: {exc}", file=sys.stderr)
+            return None
+        if result.returncode != 0:
+            print(
+                f"omarchy-agent-session-watch: omarchy-notification-send exited {result.returncode}: "
+                f"{(result.stderr or '').strip()}",
+                file=sys.stderr,
+            )
+        out = (result.stdout or "").strip()
+        new_id = None
+        if print_id and out:
+            try:
+                new_id = int(out.splitlines()[-1].strip())
+            except ValueError:
+                new_id = None
+        record["id"] = new_id
+        return new_id
+
+
+# --- Hyprland focus/fullscreen probe --------------------------------------
+#
+# spec/06-notifications.md marks both the app-id field and the fullscreen
+# field "verify on rig". Best-guess field names below, wrapped so a wrong
+# guess degrades to "never suppress, never hold" rather than crashing the
+# daemon or silently eating every notification.
+
+
+def get_active_window() -> Optional[dict]:
+    """Return `hyprctl activewindow -j` parsed as a dict, or None if
+    unavailable (no Hyprland, no focused window, hyprctl missing, etc).
+    VERIFY ON RIG: this whole probe, including that the binary is on PATH."""
+    try:
+        result = subprocess.run(
+            ["hyprctl", "activewindow", "-j"], capture_output=True, text=True, timeout=1.0, check=False
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    text = (result.stdout or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def is_session_focused(session_id: str, window: Optional[dict]) -> bool:
+    """VERIFY ON RIG: exact JSON field for the window's app id. Hyprland's
+    activewindow has historically used "class" or "initialClass" depending on
+    version; checked in that order, falling back to a literal "app_id" key in
+    case a newer hyprctl renames it."""
+    if not window:
+        return False
+    app_id = window.get("initialClass") or window.get("class") or window.get("app_id")
+    return app_id == f"{APP_ID_PREFIX}{session_id}"
+
+
+def is_fullscreen(window: Optional[dict]) -> bool:
+    """VERIFY ON RIG: exact field and truthy values. hyprctl's `fullscreen`
+    has been an integer mode (0 = not fullscreen, 1/2 = two fullscreen modes)
+    on some versions and a plain bool on others; either way, anything
+    non-zero/non-false here is treated as fullscreen."""
+    if not window:
+        return False
+    return bool(window.get("fullscreen"))
+
+
+# --- pending notice --------------------------------------------------------
+
+
+@dataclasses.dataclass
+class PendingNotice:
+    session_id: Optional[str]  # None for a digest notice
+    kind: str
+    urgency: str
+    headline: str
+    description: str
+    exec_argv: list
+    is_digest: bool = False
+
+
+# --- the watcher -------------------------------------------------------
+
+
+class SessionWatcher:
+    def __init__(
+        self,
+        sessions_dir,
+        notifier: Notifier,
+        clock: Callable[[], float] = time.monotonic,
+        active_window_fn: Callable[[], Optional[dict]] = get_active_window,
+    ):
+        self.sessions_dir = Path(sessions_dir)
+        self.notifier = notifier
+        self.clock = clock
+        self.active_window_fn = active_window_fn
+        self.cursor_path = self.sessions_dir / CURSOR_FILENAME
+        self.cursors: dict[str, int] = self._load_cursors()
+
+        self._last_sent: dict[str, tuple] = {}  # session_id -> (ts, notif_id)
+        # session_id -> (ts, kind) of that session's most recent notify-worthy
+        # event within the trailing DIGEST_WINDOW_S. Keyed by session, not a
+        # flat event log, so a single session flapping twice in the window
+        # tallies as one session in the digest text, not two -- see
+        # README-shell.md for why this reading of "N sessions need you" was
+        # chosen over a raw event count.
+        self._digest_sessions: dict[str, tuple] = {}
+        self._digest_notice_id: Optional[int] = None
+
+        self._held: dict[str, PendingNotice] = {}  # session_id -> latest held notice
+        self._held_digest: Optional[PendingNotice] = None
+        self._was_fullscreen = False
+
+    # -- cursor persistence, recovery after restart --
+
+    def _load_cursors(self) -> dict:
+        try:
+            with open(self.cursor_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        return {}
+
+    def _save_cursors(self) -> None:
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.cursor_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.cursors, f)
+        tmp.replace(self.cursor_path)  # atomic, matching session.json's own convention
+
+    # -- reading session state --
+
+    def _session_ids(self) -> list:
+        if not self.sessions_dir.is_dir():
+            return []
+        return sorted(p.name for p in self.sessions_dir.iterdir() if p.is_dir())
+
+    def _read_session_record(self, session_id: str) -> dict:
+        path = self.sessions_dir / session_id / "session.json"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _read_new_events(self, session_id: str) -> list:
+        path = self.sessions_dir / session_id / "events.jsonl"
+        cursor = self.cursors.get(session_id, 0)
+        events = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        print(
+                            f"omarchy-agent-session-watch: skipping malformed events.jsonl line "
+                            f"for session {session_id}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    seq = ev.get("seq", 0)
+                    if seq > cursor:
+                        events.append(ev)
+        except FileNotFoundError:
+            return []
+        events.sort(key=lambda e: e.get("seq", 0))
+        return events
+
+    def _lookup_name(self, other_session_id: str) -> Optional[str]:
+        if not other_session_id:
+            return None
+        return self._read_session_record(other_session_id).get("name")
+
+    # -- one scan pass: the unit this is tested through --
+
+    def scan_once(self, now: Optional[float] = None) -> None:
+        if now is None:
+            now = self.clock()
+
+        window = self._safe_active_window()
+        fullscreen_now = is_fullscreen(window)
+        if self._was_fullscreen and not fullscreen_now:
+            self._flush_held(now)
+        self._was_fullscreen = fullscreen_now
+
+        for session_id in self._session_ids():
+            events = self._read_new_events(session_id)
+            if not events:
+                continue
+            record = self._read_session_record(session_id)
+            max_seq = self.cursors.get(session_id, 0)
+            for ev in events:
+                self._handle_event(session_id, record, ev, now, window, fullscreen_now)
+                max_seq = max(max_seq, ev.get("seq", 0))
+            self.cursors[session_id] = max_seq
+
+        self._save_cursors()
+
+    def _safe_active_window(self) -> Optional[dict]:
+        try:
+            return self.active_window_fn()
+        except Exception as exc:
+            print(f"omarchy-agent-session-watch: hyprctl probe failed: {exc}", file=sys.stderr)
+            return None
+
+    # -- per-event decision --
+
+    def _handle_event(self, session_id, record, event, now, window, fullscreen_now) -> None:
+        classified = classify_event(event)
+        if classified is None:
+            return
+        kind, urgency = classified
+
+        # Self-suppression: checked first and unconditionally. A suppressed
+        # event never counts toward the digest tally either -- if the user is
+        # already looking at exactly what it would announce, it generated no
+        # interruption debt at all (spec/06-notifications.md's rationale).
+        if is_session_focused(session_id, window):
+            return
+
+        headline = render_text(kind, record, event, self._lookup_name)
+        description = render_body(kind, record, event)
+        exec_argv = click_argv(kind, session_id, record)
+
+        self._prune_digest(now)
+        pre_count = len(self._digest_sessions)
+        # Overwrites this session's own prior entry if it already had one in
+        # the window, so a session that fires twice still counts as one
+        # session, with its latest kind, in the digest tally below.
+        self._digest_sessions[session_id] = (now, kind, urgency)
+
+        if pre_count < DIGEST_THRESHOLD:
+            notice = PendingNotice(session_id, kind, urgency, headline, description, exec_argv, is_digest=False)
+        else:
+            notice = PendingNotice(
+                None, kind, self._digest_urgency(), self._digest_text(), "",
+                ["omarchy-agent-session-list"], is_digest=True,
+            )
+
+        self._deliver(notice, now, fullscreen_now)
+
+    def _prune_digest(self, now: float) -> None:
+        stale = [sid for sid, entry in self._digest_sessions.items() if (now - entry[0]) > DIGEST_WINDOW_S]
+        for sid in stale:
+            del self._digest_sessions[sid]
+        if len(self._digest_sessions) <= DIGEST_THRESHOLD:
+            # Window has decayed back to normal since the last event: "the
+            # 60-second counter resets once a full window passes with no
+            # further notice" (spec). The next digest, if any, starts fresh
+            # rather than replacing a long-dismissed toast.
+            self._digest_notice_id = None
+
+    def _digest_text(self) -> str:
+        counts = collections.Counter(entry[1] for entry in self._digest_sessions.values())
+        total = len(self._digest_sessions)
+        parts = [f"{counts[k]} {_DIGEST_LABELS[k]}" for k in _DIGEST_ORDER if counts.get(k)]
+        return f"{total} sessions need you: " + ", ".join(parts)
+
+    def _digest_urgency(self) -> str:
+        # ASSUMPTION: not stated by the spec. Uses the same low/normal/critical
+        # ladder as individual notices, at the highest level present in the
+        # window, so a burst containing a failure is never quieter than that
+        # failure alone would have been. Flagged in README-shell.md.
+        # The digest carries the highest urgency its members were classified
+        # with, so a burst containing a failure is never quieter than that
+        # failure alone, and a reboot's Herdr-down orphans (classified
+        # normal) do not escalate to critical by being many.
+        ladder = {"low": 0, "normal": 1, "critical": 2}
+        best = "low"
+        for entry in self._digest_sessions.values():
+            urgency = entry[2] if len(entry) > 2 else "critical"
+            if ladder.get(urgency, 0) > ladder[best]:
+                best = urgency
+        return best
+
+    # -- fullscreen hold / coalescing / dispatch --
+
+    def _deliver(self, notice: PendingNotice, now: float, fullscreen_now: bool) -> None:
+        if fullscreen_now:
+            # Held, not suppressed: flushed once fullscreen ends. A second
+            # held notice for the same session (or a second held digest)
+            # simply overwrites the first -- the same "one pending notice"
+            # rule as live coalescing, applied to the hold queue itself
+            # (spec doesn't say what happens if two notify-worthy events land
+            # for one session during one fullscreen stretch; this is the
+            # reading that keeps the "one pending notice per session"
+            # invariant true throughout, not just once fullscreen ends).
+            if notice.is_digest:
+                self._held_digest = notice
+            else:
+                self._held[notice.session_id] = notice
+            return
+        self._send_now(notice, now)
+
+    def _send_now(self, notice: PendingNotice, now: float) -> None:
+        if notice.is_digest:
+            replaces = self._digest_notice_id
+        else:
+            prev = self._last_sent.get(notice.session_id)
+            replaces = prev[1] if prev and (now - prev[0]) < COALESCE_WINDOW_S else None
+
+        new_id = self.notifier.send(
+            notice.headline,
+            notice.description,
+            notice.urgency,
+            exec_argv=notice.exec_argv,
+            replaces_id=replaces,
+            print_id=True,
+        )
+
+        if notice.is_digest:
+            self._digest_notice_id = new_id
+        else:
+            self._last_sent[notice.session_id] = (now, new_id)
+
+    def _flush_held(self, now: float) -> None:
+        for session_id in list(self._held.keys()):
+            notice = self._held.pop(session_id)
+            self._send_now(notice, now)
+        if self._held_digest is not None:
+            notice, self._held_digest = self._held_digest, None
+            self._send_now(notice, now)
+
+
+# --- optional Herdr events.subscribe nudge --------------------------------
+
+
+def herdr_nudge_thread(wake_event: threading.Event, stop_event: threading.Event) -> None:
+    """Best-effort low-latency wake-up: connects to the Herdr socket and
+    sets wake_event whenever a line arrives, without reading or acting on its
+    content. events.jsonl stays the sole source of truth for what to notify
+    (spec/06-notifications.md), so a wrong assumption in here only costs
+    latency -- worst case, the watcher falls back to its plain poll interval
+    -- never correctness. VERIFY ON RIG, entirely: whether HERDR_SOCKET is a
+    Unix domain socket at all, whether events.subscribe is the right
+    method name and shape, and whether the stream really is newline-delimited
+    JSON, per herdr.dev/docs as cited in 06-notifications.md (observed
+    2026-09-01, not independently confirmed here)."""
+    # Same default as the core (~/.config/herdr/herdr.sock, the path the rig
+    # confirmed 2026-09-02); HERDR_SOCKET still overrides, and an empty
+    # value turns the nudge off.
+    socket_path = os.environ.get("HERDR_SOCKET", os.path.expanduser("~/.config/herdr/herdr.sock"))
+    if not socket_path:
+        return
+
+    backoff = 1.0
+    while not stop_event.is_set():
+        try:
+            if not os.path.exists(socket_path):
+                stop_event.wait(backoff)
+                continue
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1.0)
+                sock.connect(socket_path)
+                # Verified on the rig 2026-09-02: params take a list of
+                # subscriptions; pane.updated fires on status changes too,
+                # and these four types need no pane_id, so one subscription
+                # covers every pane as a wake-up nudge.
+                subscribe_msg = json.dumps(
+                    {
+                        "id": "omarchy-agent-session-watch",
+                        "method": "events.subscribe",
+                        "params": {
+                            "subscriptions": [
+                                {"type": "pane.updated"},
+                                {"type": "pane.exited"},
+                                {"type": "pane.closed"},
+                                {"type": "pane.agent_detected"},
+                            ]
+                        },
+                    }
+                )
+                sock.sendall((subscribe_msg + "\n").encode("utf-8"))
+                buf = b""
+                backoff = 1.0
+                while not stop_event.is_set():
+                    try:
+                        chunk = sock.recv(4096)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        _line, buf = buf.split(b"\n", 1)
+                        wake_event.set()
+        except Exception as exc:
+            print(
+                f"omarchy-agent-session-watch: Herdr subscription unavailable ({exc}); "
+                "falling back to plain polling",
+                file=sys.stderr,
+            )
+            stop_event.wait(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
+# --- CLI --------------------------------------------------------------
+
+
+def default_sessions_dir() -> str:
+    return os.environ.get("OMARCHY_SESSIONS_DIR") or str(Path.home() / ".local/state/omarchy/sessions")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omarchy-agent-session-watch",
+        description="Notify on agent session state changes needing attention.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print the omarchy-notification-send argv instead of calling it"
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single scan pass and exit (not in the spec; for manual testing without Omarchy)",
+    )
+    parser.add_argument(
+        "--interval", type=float, default=1.0, help="Seconds between scan passes in the run loop (default: 1.0)"
+    )
+    parser.add_argument(
+        "--sessions-dir", default=None, help="Override OMARCHY_SESSIONS_DIR for this run"
+    )
+    return parser
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+
+    sessions_dir = args.sessions_dir or default_sessions_dir()
+    Path(sessions_dir).mkdir(parents=True, exist_ok=True)
+
+    notifier = Notifier(dry_run=args.dry_run)
+    watcher = SessionWatcher(sessions_dir, notifier)
+
+    if args.once:
+        watcher.scan_once()
+        return 0
+
+    stop_event = threading.Event()
+    wake_event = threading.Event()
+    nudge_thread = threading.Thread(target=herdr_nudge_thread, args=(wake_event, stop_event), daemon=True)
+    nudge_thread.start()
+
+    # Herdr status changes only reach events.jsonl through the reconciler
+    # (01-session-model.md: the reconciler writes status.changed from
+    # Herdr's agent status). The watcher is the one long-lived process, so
+    # it runs `reconcile` on every Herdr nudge and at least every
+    # `reconcile_every` seconds; a failure is logged and never fatal.
+    reconcile_every = 5.0
+    last_reconcile = 0.0
+    reconcile_cmd = shutil.which("omarchy-agent-session-reconcile") or "omarchy-agent-session-reconcile"
+
+    def reconcile(force: bool) -> None:
+        nonlocal last_reconcile
+        now = time.monotonic()
+        if not force and now - last_reconcile < reconcile_every:
+            return
+        last_reconcile = now
+        try:
+            subprocess.run([reconcile_cmd], capture_output=True, text=True, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"omarchy-agent-session-watch: reconcile failed ({exc})", file=sys.stderr)
+
+    try:
+        while True:
+            nudged = wake_event.is_set()
+            wake_event.clear()
+            reconcile(force=nudged)
+            watcher.scan_once()
+            wake_event.wait(args.interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

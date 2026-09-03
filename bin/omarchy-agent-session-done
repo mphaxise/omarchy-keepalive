@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# omarchy:summary=Close a session's loop with a verdict
+# omarchy:args=<id-or-name> --verdict kept|reverted|needs-person --note <text>
+# omarchy:examples=omarchy agent session done api-refactor --verdict kept --note "focus trap fixed, verified on rig"
+
+set -euo pipefail
+
+# Defined in spec/09-closed-loop-surfaces.md, not spec/02-command-surface.md.
+# Fires the transition into `done`, and writes the note as a note artifact,
+# authored by the owner and labeled "verdict". The example above is
+# synthesized: 09-closed-loop-surfaces.md gives no verbatim "Example:" line
+# for this command.
+exec omarchy-agent-session-core done "$@"

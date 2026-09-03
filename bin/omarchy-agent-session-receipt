@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# omarchy:summary=Print a session's receipt, optionally recomputing it first
+# omarchy:args=<id-or-name> [--json] [--write]
+# omarchy:examples=omarchy agent session receipt api-refactor --write
+
+set -euo pipefail
+
+# --write recomputes now from git log/diff-stat against base_branch, not
+# Herdr, and writes receipt.written (spec/02-command-surface.md).
+exec omarchy-agent-session-core receipt "$@"
