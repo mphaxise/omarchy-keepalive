@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# omarchy:summary=Who has a session open right now; --here and --leave mark yourself
+# omarchy:args=<id-or-name> [--here|--leave]
+# omarchy:examples=omarchy agent session presence api-refactor --here
+
+set -euo pipefail
+
+# Defined in spec/12-two-people.md.
+exec omarchy-agent-session-core presence "$@"

@@ -50,12 +50,14 @@ CursorSurface {
   signal sendCancelRequested(string id)
   signal stopArmRequested(string id)
   signal stopConfirmRequested(string id)
+  signal pauseRequested(string id)
   signal hoverRequested(string id)
   signal previewRequested(string id)
   signal addOpenRequested(string id)
   signal addSubmitRequested(string id, string text)
   signal addCancelRequested(string id)
   signal laneSelectRequested(string id, string lane)
+  signal suggestionDecided(string id, bool dismiss)
 
   readonly property string sid: session ? String(session.id || "") : ""
   readonly property string sname: session && session.name ? String(session.name) : sid
@@ -81,6 +83,16 @@ CursorSurface {
   // and Array.isArray says false (rig, run 9, 2026-09-03: lane lines never
   // showed). Test length, never isArray, on anything read from `session`.
   readonly property var lanes: session && session.lanes && session.lanes.length !== undefined ? session.lanes : []
+  // 12-two-people.md: suggestions waiting on the owner, and who has the
+  // session open right now (presence, from the runtime dir, never the record).
+  readonly property var suggestions: session && session.suggestions && session.suggestions.length !== undefined ? session.suggestions : []
+  readonly property bool hasSuggestion: suggestions.length > 0
+  // author_display is the core's name for the suggester as this person
+  // should read it (user@host when the label would read as their own).
+  readonly property string suggester: hasSuggestion ? String(suggestions[0].author_display || (suggestions[0].author && suggestions[0].author.label) || "someone") : "someone"
+  readonly property var presence: session && session.presence && session.presence.length !== undefined ? session.presence : []
+  // The owner when it is someone else; the core sends null when it is you.
+  readonly property string ownedByOther: session && session.owned_by_other ? String(session.owned_by_other) : ""
   readonly property bool hasLanes: lanes.length > 0
   readonly property var attentionLane: session && session.attention_lane ? session.attention_lane : null
   readonly property bool laneNeedsYou: !needsAttention && attentionLane !== null
@@ -88,14 +100,22 @@ CursorSurface {
   readonly property bool isLive: state === "starting" || state === "working" || state === "idle"
     || state === "waiting" || state === "blocked"
   readonly property bool isOrphaned: state === "orphaned"
+  // A live session with no process, parked by a person (01-session-model.md,
+  // 2026-09-03): Resume, Send (queued), Stop; never Pause again.
+  readonly property bool isPaused: state === "paused"
   readonly property bool isEnded: state === "done" || state === "failed" || state === "stopped"
   readonly property string statusDetail: session && session.status ? String(session.status.detail || "") : ""
-  // An end the reconciler inferred from a vanished harness, with a
-  // transcript on disk: nobody decided it was over, so Enter revives it
+  // Whether Enter brings the session back: the core decides and says so
+  // as `revivable` (02-command-surface.md, 2026-09-03): orphaned; an end
+  // the reconciler inferred from a vanished harness, with a transcript
   // (a reboot before the restart rule ended two sessions this way, rig
-  // 2026-09-02 22:30). The receipt stays on `r`.
-  readonly property bool revivable: isOrphaned
-    || (isEnded && resumable && statusDetail.indexOf("harness exited") === 0)
+  // 2026-09-02 22:30); a stop with a transcript, since a stop is a pause.
+  // The older rule stays as the fallback for a core that predates the
+  // field. The receipt stays on `r` either way.
+  readonly property bool revivable: (session && typeof session.revivable === "boolean")
+    ? session.revivable
+    : (isOrphaned || isPaused || (isEnded && resumable && statusDetail.indexOf("harness exited") === 0))
+  readonly property bool isStopped: state === "stopped"
 
   readonly property var spinnerFrames: ["◐", "◓", "◑", "◒"]
   property int spinnerIndex: 0
@@ -126,7 +146,9 @@ CursorSurface {
     var age = ageText()
     if (state === "blocked" || state === "waiting") return "needs you" + (age !== "" ? " · " + age : "")
     if (laneNeedsYou) return attentionLane.lane + " needs you"
+    if (hasSuggestion && !needsAttention) return suggester + " suggests"
     if (state === "orphaned") return "orphaned · " + (resumable ? "resumes conversation" : "fresh start")
+    if (state === "paused") return "paused" + (age !== "" ? " · " + age : "")
     if (isEnded && revivable) return state + " · resumes conversation"
     if (state === "starting") return "starting" + (age !== "" ? " · " + age : "")
     return state + (age !== "" ? " · " + age : "")
@@ -137,6 +159,7 @@ CursorSurface {
     if (actionResult) return actionResult.ok ? foreground : urgentColor
     if (stopping) return urgentColor
     if (state === "blocked" || state === "waiting" || laneNeedsYou) return urgentColor
+    if (hasSuggestion && !needsAttention) return accent
     if (state === "orphaned" || state === "failed") return foreground
     return dim
   }
@@ -146,18 +169,24 @@ CursorSurface {
   // urgent = failed; filled rest color = alive or ended quietly.
   readonly property color dotColor: (state === "blocked" || state === "waiting" || state === "failed" || laneNeedsYou)
     ? urgentColor : (state === "orphaned" ? foreground : restColor)
-  readonly property bool dotHollow: state === "orphaned" || state === "failed"
+  readonly property bool dotHollow: state === "orphaned" || state === "failed" || state === "paused"
 
   readonly property string loopText: (loopInstructions > 0 || loopCaptures > 0)
     ? (loopInstructions + " instruction" + (loopInstructions === 1 ? "" : "s") + ", " + loopCaptures + " capture" + (loopCaptures === 1 ? "" : "s"))
     : ""
   // The loop count leads so a long goal cannot elide it away
   // (09-closed-loop-surfaces.md section 7).
-  readonly property string detailText: [loopText, goal !== "" ? goal
-    : [project, branch].filter(function(t) { return t !== "" }).join(" · ")]
+  readonly property string suggestionText: hasSuggestion ? ("\u201c" + String(suggestions[0].text || "").split("\n")[0] + "\u201d") : ""
+  readonly property string presenceText: presence.length > 1 ? (presence.length + " here") : ""
+  readonly property string ownerText: ownedByOther !== "" ? ("owned by " + ownedByOther) : ""
+  readonly property string detailText: [suggestionText, ownerText, loopText, goal !== "" ? goal
+    : [project, branch].filter(function(t) { return t !== "" }).join(" · "), presenceText]
     .filter(function(t) { return t !== "" }).join(" · ")
 
-  readonly property string openLabel: revivable ? "⏎ Revive" : (isEnded ? "⏎ Receipt" : (needsAttention ? "⏎ Answer" : "⏎ Open"))
+  // Revive is for a session that lost its pane without anyone deciding;
+  // Resume is for one a person stopped (03-sessions-panel.md, row actions).
+  readonly property string openLabel: revivable ? ((isStopped || isPaused) ? "⏎ Resume" : "⏎ Revive")
+    : (isEnded ? "⏎ Receipt" : (needsAttention ? "⏎ Answer" : "⏎ Open"))
 
   function stopLabel() {
     if (stopping) return "stopping…"
@@ -393,8 +422,9 @@ CursorSurface {
         width: parent.width - sendButton.width - Style.space(6)
         placeholderText: row.selectedLane !== "" ? ("Send to lane " + row.selectedLane + "…")
           : (row.isOrphaned ? "Queue an instruction, delivered on revive…"
+          : (row.isPaused ? "Queue an instruction, delivered on resume…"
           : (row.hasPreview ? "Feedback on the preview (a capture goes with it)…"
-          : (row.hasLanes ? "Send to every lane…" : "Send an instruction…")))
+          : (row.hasLanes ? "Send to every lane…" : "Send an instruction…"))))
         focus: row.sendOpen
         foreground: row.foreground
         accent: row.accent
@@ -412,7 +442,10 @@ CursorSurface {
     }
 
     // ---------- line 3, cursor row only: the actions ----------
-    Row {
+    // A Flow, since 2026-09-03: five buttons on a live row (Open, Send,
+    // Pause, Stop, Add) wrap to a second line at 400 px instead of running
+    // past the panel's edge.
+    Flow {
       width: parent.width
       spacing: Style.space(8)
       visible: row.hasCursor && !row.sendOpen && !row.addOpen
@@ -437,7 +470,7 @@ CursorSurface {
         onClicked: row.receiptRequested(row.sid)
       }
       Button {
-        visible: row.isLive || row.isOrphaned
+        visible: row.isLive || row.isOrphaned || row.isPaused
         text: "s Send"
         bordered: true
         enabled: !row.stopping && row.busyText === ""
@@ -447,7 +480,25 @@ CursorSurface {
         onClicked: row.sendOpenRequested(row.sid)
       }
       Button {
-        visible: row.isLive
+        visible: row.hasSuggestion
+        text: "y Accept"
+        bordered: true
+        foreground: row.accent
+        fontFamily: row.fontFamily
+        fontSize: Style.font.caption
+        onClicked: row.suggestionDecided(row.sid, false)
+      }
+      Button {
+        visible: row.hasSuggestion
+        text: "d Dismiss"
+        bordered: true
+        foreground: row.foreground
+        fontFamily: row.fontFamily
+        fontSize: Style.font.caption
+        onClicked: row.suggestionDecided(row.sid, true)
+      }
+      Button {
+        visible: row.isLive && !row.hasSuggestion
         text: "a Add"
         bordered: true
         foreground: row.foreground
@@ -466,6 +517,16 @@ CursorSurface {
       }
       Button {
         visible: row.isLive || row.isOrphaned
+        text: "z Pause"
+        bordered: true
+        enabled: !row.stopping && row.busyText === ""
+        foreground: row.foreground
+        fontFamily: row.fontFamily
+        fontSize: Style.font.caption
+        onClicked: row.pauseRequested(row.sid)
+      }
+      Button {
+        visible: row.isLive || row.isOrphaned || row.isPaused
         text: row.stopLabel()
         bordered: true
         enabled: !row.stopping

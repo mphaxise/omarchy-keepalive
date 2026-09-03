@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# omarchy:summary=Make a session private, draft, or shared
+# omarchy:args=<id-or-name> private|draft|shared
+# omarchy:examples=omarchy agent session visibility api-refactor draft
+
+set -euo pipefail
+
+# Defined in spec/12-two-people.md.
+exec omarchy-agent-session-core visibility "$@"

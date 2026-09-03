@@ -157,6 +157,11 @@ Panel {
 
   readonly property var allSessions: snapshot && Array.isArray(snapshot.sessions) ? snapshot.sessions : []
   readonly property bool hasErrorRow: !!snapshot && typeof snapshot.error === "string" && snapshot.error !== ""
+  // How many sessions ended before the window the list was asked through
+  // (scripts/snapshot.sh passes --ended-within 24h; 02-command-surface.md).
+  // The record keeps them; `e` opens History. Zero from a core that
+  // predates the window, which then sends everything and never drops.
+  readonly property int earlierEnded: snapshot && snapshot.window ? Math.max(0, Number(snapshot.window.earlier_ended || 0)) : 0
 
   function scriptPath(name) {
     return Qt.resolvedUrl("scripts/" + name).toString().replace(/^file:\/\//, "")
@@ -200,7 +205,12 @@ Panel {
         // the last nowMs read as a negative age (the hero's "0M", rig e5).
         var previousIndex = root.selectedIndex
         root.nowMs = Date.now()
-        root.snapshot = { sessions: root.foldLanes(Array.isArray(parsed.sessions) ? parsed.sessions : []) }
+        root.snapshot = {
+          sessions: root.foldLanes(Array.isArray(parsed.sessions) ? parsed.sessions : []),
+          // The window the list was asked through, with how much ended
+          // before it (absent from a core that predates the window).
+          window: (parsed.window && typeof parsed.window === "object") ? parsed.window : null
+        }
         root.clearStoppedFromStopping(root.snapshot.sessions)
         root.reconcileCursor(previousIndex)
         root.recordSuccess()
@@ -298,8 +308,10 @@ Panel {
     return isFinite(ms) ? ms : 0
   }
 
+  // blocked and waiting are agents asking; "suggested" is a person
+  // waiting on the owner's decision (12-two-people.md) and ranks after them.
   function attentionRank(state) {
-    return state === "blocked" ? 0 : (state === "waiting" ? 1 : 2)
+    return state === "blocked" ? 0 : (state === "waiting" ? 1 : (state === "suggested" ? 2 : 3))
   }
 
   // 11-agent-lanes.md: a lane is a child session the list marks with
@@ -322,8 +334,9 @@ Panel {
       }
       s.attention_lane = att
       var own = s.needs_attention === true
-      s.att_state = own ? s.status.state : (att ? att.state : (s.status ? s.status.state : ""))
-      s.att_since = own ? s.status.since : (att ? att.since : (s.status ? s.status.since : ""))
+      var sugg = Array.isArray(s.suggestions) ? s.suggestions : []
+      s.att_state = own ? s.status.state : (att ? att.state : (sugg.length > 0 ? "suggested" : (s.status ? s.status.state : "")))
+      s.att_since = own ? s.status.since : (att ? att.since : (sugg.length > 0 && sugg[0].queued_at ? sugg[0].queued_at : (s.status ? s.status.since : "")))
       s.lane_attention_count = lanes.filter(function(x) { return x.needs_attention }).length
       out.push(s)
     }
@@ -333,7 +346,7 @@ Panel {
   // 1. Needs you: blocked, waiting; the longest-neglected session leads.
   function needsYouSessions() {
     var list = root.allSessions.filter(function(s) {
-      return s.status && (s.att_state === "blocked" || s.att_state === "waiting")
+      return s.status && (s.att_state === "blocked" || s.att_state === "waiting" || s.att_state === "suggested")
     })
     list.sort(function(a, b) {
       var r = root.attentionRank(a.att_state) - root.attentionRank(b.att_state)
@@ -353,12 +366,20 @@ Panel {
   // 3. Working: starting, working, idle. Most recently changed first.
   function workingSessions() {
     var states = { starting: true, working: true, idle: true }
-    var list = root.allSessions.filter(function(s) { return s.status && states[s.status.state] && !s.attention_lane })
+    var list = root.allSessions.filter(function(s) { return s.status && states[s.status.state] && !s.attention_lane && s.att_state !== "suggested" })
     list.sort(function(a, b) { return root.sinceMs(b) - root.sinceMs(a) })
     return list
   }
 
-  // 4. Done today: done, failed, stopped in the last 24 h, newest first.
+  // 4. Paused: a live session with no process, newest pause first, and no
+  // window: it stays until it is resumed or stopped (01-session-model.md).
+  function pausedSessions() {
+    var list = root.allSessions.filter(function(s) { return s.status && s.status.state === "paused" })
+    list.sort(function(a, b) { return root.sinceMs(b) - root.sinceMs(a) })
+    return list
+  }
+
+  // 5. Done today: done, failed, stopped in the last 24 h, newest first.
   function doneTodaySessions() {
     var states = { done: true, failed: true, stopped: true }
     var cutoff = root.nowMs - 24 * 3600 * 1000
@@ -372,13 +393,14 @@ Panel {
   readonly property var needsYouRows: needsYouSessions()
   readonly property var orphanedRows: orphanedSessions()
   readonly property var workingRows: workingSessions()
+  readonly property var pausedRows: pausedSessions()
   readonly property var doneRows: doneTodaySessions()
   readonly property var doneShownRows: doneExpanded ? doneRows : doneRows.slice(0, doneRowsCollapsed)
   readonly property int doneHiddenCount: doneRows.length - doneShownRows.length
 
   // maxRows caps the flattened total; Done today is concatenated last, so
   // it is what gets trimmed.
-  readonly property var visibleRows: needsYouRows.concat(orphanedRows).concat(workingRows).concat(doneShownRows).slice(0, root.maxRows)
+  readonly property var visibleRows: needsYouRows.concat(orphanedRows).concat(workingRows).concat(pausedRows).concat(doneShownRows).slice(0, root.maxRows)
 
   // The badge counts every agent that is asking: sessions and their lanes.
   readonly property int needsAttentionCount: allSessions.reduce(function(n, s) {
@@ -386,6 +408,7 @@ Panel {
   }, 0)
   readonly property int workingCount: allSessions.filter(function(s) { return s.status && (s.status.state === "working" || s.status.state === "starting") }).length
   readonly property int idleCount: allSessions.filter(function(s) { return s.status && s.status.state === "idle" }).length
+  readonly property int pausedCount: pausedRows.length
 
   // Bar glyph: urgent when someone needs you; foreground when a session
   // is orphaned (that needs a person too, without the badge); the rest
@@ -398,7 +421,10 @@ Panel {
   readonly property color barGlyphColor: barState === "needs-you" ? urgentColor
     : (barState === "orphaned" ? foreground : restColor)
 
-  visible: allSessions.length > 0 || showWhenEmpty || hasErrorRow
+  // Hidden only on a fresh install: once a record exists the icon stays,
+  // because an icon that leaves with the last live session reads as the
+  // sessions being gone (03-sessions-panel.md, 2026-09-03).
+  visible: allSessions.length > 0 || earlierEnded > 0 || showWhenEmpty || hasErrorRow
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -408,8 +434,12 @@ Panel {
     if (root.hasErrorRow) return "Sessions"
     if (root.needsYouRows.length > 0) return root.needsYouRows[0].name || root.needsYouRows[0].id
     if (root.orphanedRows.length > 0) return root.orphanedRows.length + " orphaned"
-    if (root.allSessions.length === 0) return "No sessions"
+    if (root.allSessions.length === 0) return root.earlierEnded > 0 ? "Nothing running" : "No sessions"
     return "Nothing needs you"
+  }
+
+  function earlierText() {
+    return root.earlierEnded + " earlier"
   }
 
   function heroMeta() {
@@ -418,17 +448,24 @@ Panel {
       base = "list unavailable"
     } else if (root.needsYouRows.length > 0) {
       var first = root.needsYouRows[0]
-      var who = first.needs_attention !== true && first.attention_lane ? ("lane " + first.attention_lane.lane + " needs you · ") : "needs you · "
-      base = who + root.formatDuration(root.nowMs - Date.parse(first.att_since || "")) + " · Enter opens"
+      var suggested = first.att_state === "suggested"
+      var who = first.needs_attention !== true && first.attention_lane ? ("lane " + first.attention_lane.lane + " needs you · ")
+        : (suggested ? (String(first.suggestions[0].author_display || (first.suggestions[0].author && first.suggestions[0].author.label) || "someone") + " suggests · ") : "needs you · ")
+      var owner = first.owned_by_other ? (" · owned by " + first.owned_by_other) : ""
+      var age = root.formatDuration(root.nowMs - Date.parse(first.att_since || ""))
+      // The action hint outranks the age: a long name elides the tail
+      // (rig, run 10b: "y accep…"), so for a suggestion the age goes last.
+      base = suggested ? (who + "y accepts · " + age + owner) : (who + age + owner + " · Enter opens")
       if (root.needsYouRows.length > 1) base += " · " + (root.needsYouRows.length - 1) + " more need you"
     } else if (root.orphanedRows.length > 0) {
       base = root.herdrDown ? "Herdr is not running · Enter revives" : "Enter revives"
     } else if (root.allSessions.length === 0) {
-      base = "n starts one"
+      base = root.earlierEnded > 0 ? (root.earlierText() + " · e history · n new") : "n starts one"
     } else {
       var parts = []
       if (root.workingCount > 0) parts.push(root.workingCount + " working")
       if (root.idleCount > 0) parts.push(root.idleCount + " idle")
+      if (root.pausedCount > 0) parts.push(root.pausedCount + " paused")
       if (root.doneRows.length > 0) parts.push(root.doneRows.length + " done today")
       base = parts.length > 0 ? parts.join(" · ") : "all quiet"
     }
@@ -515,6 +552,9 @@ Panel {
     } else if (kind === "preview") {
       if (code === 0) { root.close(); return }
       root.setResult(sid, "no preview to show · " + root.reason(code), false)
+    } else if (kind === "accept" || kind === "dismiss") {
+      if (code === 0) root.setResult(sid, kind === "accept" ? "accepted, sent" : "dismissed", true)
+      else root.setResult(sid, "couldn't " + kind + " · " + root.reason(code), false)
     } else if (kind === "add") {
       if (code === 0) { root.addOpenId = ""; root.setResult(sid, "agent added", true) }
       else root.setResult(sid, "couldn't add · " + root.reason(code), false)
@@ -527,6 +567,9 @@ Panel {
       if (code === 0) return                     // the spinner runs until the record reports stopped
       var next = Object.assign({}, root.stoppingIds); delete next[sid]; root.stoppingIds = next
       root.setResult(sid, "stop failed · " + root.reason(code), false)
+    } else if (kind === "pause") {
+      if (code === 0) root.setResult(sid, "paused", true)
+      else root.setResult(sid, "couldn't pause · " + root.reason(code), false)
     }
     root.refresh()
   }
@@ -535,10 +578,13 @@ Panel {
     return !!(s && s.status && (s.status.state === "done" || s.status.state === "failed" || s.status.state === "stopped"))
   }
 
-  // Mirrors Session.qml's `revivable`: orphaned, or ended by the
-  // reconciler's inference with a transcript to resume.
+  // Mirrors Session.qml's `revivable`: the core's own `revivable` field
+  // when the payload carries it (02-command-surface.md, 2026-09-03);
+  // otherwise orphaned, or ended by the reconciler's inference with a
+  // transcript to resume.
   function sessionRevivable(s) {
     if (!s || !s.status) return false
+    if (typeof s.revivable === "boolean") return s.revivable
     if (s.status.state === "orphaned") return true
     return root.sessionEnded(s) && s.resumable === true && String(s.status.detail || "").indexOf("harness exited") === 0
   }
@@ -553,7 +599,17 @@ Panel {
     var s = root.sessionById(id)
     var argv = ["omarchy-agent-session-open", String(id)]
     if (lane) argv.push("--lane", String(lane))
-    root.runAction(id, "open", argv, root.sessionRevivable(s) ? "reviving…" : "opening…")
+    var busy = "opening…"
+    if (root.sessionRevivable(s)) busy = (s.status.state === "stopped" || s.status.state === "paused") ? "resuming…" : "reviving…"
+    root.runAction(id, "open", argv, busy)
+  }
+
+  // History: what ended before the panel's window, fourteen days by day,
+  // in a TUI window the way the receipt opens (03-sessions-panel.md).
+  function openHistory() {
+    Quickshell.execDetached(["omarchy-launch-tui", "--app-id=org.omarchy.session-history",
+                             "omarchy-agent-session-history", "--pager"])
+    root.close()
   }
 
   // The cursor's lane, or the lane that needs you when the cursor is on
@@ -578,6 +634,14 @@ Panel {
       if (lanes[i].lane === root.selectedLane) { root.selectedLane = i + 1 < lanes.length ? lanes[i + 1].lane : ""; return }
     }
     root.selectedLane = ""
+  }
+
+  // 12-two-people.md: the owner accepts or dismisses the oldest suggestion.
+  function decideSuggestion(id, dismiss) {
+    if (!id) return
+    var argv = ["omarchy-agent-session-accept", String(id)]
+    if (dismiss) argv.push("--dismiss")
+    root.runAction(id, dismiss ? "dismiss" : "accept", argv, dismiss ? "dismissing…" : "accepting…")
   }
 
   // Add an agent to a live session (11-agent-lanes.md): the field's text
@@ -641,6 +705,17 @@ Panel {
     if (lane) argv.push("--lane", String(lane))
     else { var next = Object.assign({}, root.stoppingIds); next[String(id)] = Date.now(); root.stoppingIds = next }
     root.runAction(id, "stop", argv, lane ? "stopping lane…" : "")
+  }
+
+  // Pause: one press, no confirmation, because it is reversible
+  // (03-sessions-panel.md, 2026-09-03). A lane under the cursor pauses
+  // the lane alone.
+  function pauseSession(id, lane) {
+    if (!id) return
+    var argv = ["omarchy-agent-session-pause", String(id)]
+    if (lane) argv.push("--lane", String(lane))
+    root.armedStopId = ""
+    root.runAction(id, "pause", argv, lane ? "pausing lane…" : "pausing…")
   }
 
   function clearStoppedFromStopping(sessions) {
@@ -768,8 +843,9 @@ Panel {
     // Priority order, six entries at most: that is what fits 400 px at the
     // default font (run 4, 2026-09-03). "→ more" also sits on the Done
     // today header, and esc closes every panel, so they give way first.
-    var parts = ["↑↓ move", "⏎ open", "s send", "x stop", "n new"]
     var cur = root.selectedSession
+    var hasSugg = cur && Array.isArray(cur.suggestions) && cur.suggestions.length > 0
+    var parts = hasSugg ? ["↑↓ move", "y accept", "d dismiss", "s send", "x stop"] : ["↑↓ move", "⏎ open", "s send", "x stop", "n new"]
     var curLive = cur && cur.status && !root.sessionEnded(cur) && cur.status.state !== "orphaned"
     if (cur && Array.isArray(cur.lanes) && cur.lanes.length > 0) parts.push("w lane")
     else if (curLive) parts.push("a add")
@@ -861,6 +937,9 @@ Panel {
       onTextKey: function(t) {
         if (root.sendOpenId !== "" || root.newOpen || root.addOpenId !== "") return
         if (t === "n" || t === "N") { root.openNew(); return }
+        // `e` for earlier: History needs no row under the cursor. (`h`
+        // is an arrow to PanelKeyCatcher, like j, k, and l; run 9.)
+        if (t === "e" || t === "E") { root.openHistory(); return }
         var s = root.selectedSession
         if (!s) return
         var ended = s.status && (s.status.state === "done" || s.status.state === "failed" || s.status.state === "stopped")
@@ -877,11 +956,25 @@ Panel {
           // 11-agent-lanes.md. `w`, because PanelKeyCatcher takes h, j, k,
           // and l as arrows before onTextKey sees them (run 9, 2026-09-03).
           root.walkLane(s)
+        } else if (t === "y" || t === "Y") {
+          if (s.suggestions && s.suggestions.length > 0) root.decideSuggestion(s.id, false)
+        } else if (t === "d" || t === "D") {
+          if (s.suggestions && s.suggestions.length > 0) root.decideSuggestion(s.id, true)
         } else if (t === "a" || t === "A") {
-          if (ended || s.status.state === "orphaned") return
+          if (ended || s.status.state === "orphaned" || s.status.state === "paused") return
           root.armedStopId = ""
           root.sendOpenId = ""
           root.addOpenId = s.id
+        } else if (t === "z" || t === "Z") {
+          // Pause, one press (03-sessions-panel.md). Live or orphaned rows;
+          // a lane under the cursor pauses that lane.
+          if (ended || s.status.state === "paused") return
+          var lane = root.selectedLane
+          if (lane) {
+            var le = root.laneEntry(s, lane)
+            if (le && (le.state === "done" || le.state === "failed" || le.state === "stopped" || le.state === "paused")) return
+          }
+          root.pauseSession(s.id, lane)
         }
       }
 
@@ -1083,7 +1176,10 @@ Panel {
 
               Text {
                 width: parent.width
-                text: root.snapshot ? "No sessions yet. Press n, or click above, to start one." : "Checking for sessions…"
+                text: !root.snapshot ? "Checking for sessions…"
+                  : (root.earlierEnded > 0
+                     ? ("Nothing running. " + root.earlierEnded + " ended earlier: e opens History. n starts one.")
+                     : "No sessions yet. Press n, or click above, to start one.")
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -1098,7 +1194,8 @@ Panel {
                 { title: "NEEDS YOU", rows: root.needsYouRows, offset: 0, hidden: 0 },
                 { title: "ORPHANED", rows: root.orphanedRows, offset: root.needsYouRows.length, hidden: 0 },
                 { title: "WORKING", rows: root.workingRows, offset: root.needsYouRows.length + root.orphanedRows.length, hidden: 0 },
-                { title: "DONE TODAY", rows: root.doneShownRows, offset: root.needsYouRows.length + root.orphanedRows.length + root.workingRows.length, hidden: root.doneHiddenCount }
+                { title: "PAUSED", rows: root.pausedRows, offset: root.needsYouRows.length + root.orphanedRows.length + root.workingRows.length, hidden: 0 },
+                { title: "DONE TODAY", rows: root.doneShownRows, offset: root.needsYouRows.length + root.orphanedRows.length + root.workingRows.length + root.pausedRows.length, hidden: root.doneHiddenCount }
               ]
 
               delegate: Column {
@@ -1179,11 +1276,39 @@ Panel {
                     onAddSubmitRequested: function(id, text) { root.addAgent(id, text) }
                     onAddCancelRequested: function(id) { root.addOpenId = "" }
                     onLaneSelectRequested: function(id, lane) { root.setCursor(id, false); root.selectedLane = lane }
+                    onSuggestionDecided: function(id, dismiss) { root.setCursor(id, false); root.decideSuggestion(id, dismiss) }
                     onSendCancelRequested: function(id) { root.sendOpenId = "" }
                     onStopArmRequested: function(id) { root.setCursor(id, false); root.sendOpenId = ""; root.armedStopId = id }
                     onStopConfirmRequested: function(id) { root.stopSession(id, root.selectedId === id ? root.selectedLane : ""); root.armedStopId = "" }
+                    onPauseRequested: function(id) { root.setCursor(id, false); root.pauseSession(id, root.selectedId === id ? root.selectedLane : "") }
                   }
                 }
+              }
+            }
+
+            // ---------- Earlier: what ended before the window ----------
+            // Under the last section, so the day the panel shows ends
+            // with a pointer to the days it does not (03-sessions-panel.md).
+            Item {
+              visible: !root.hasErrorRow && root.earlierEnded > 0 && root.allSessions.length > 0
+              width: parent.width
+              height: visible ? earlierText.implicitHeight + Style.space(8) : 0
+
+              Text {
+                id: earlierText
+                textFormat: Text.PlainText
+                text: root.earlierText() + " · e"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openHistory()
               }
             }
 

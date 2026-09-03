@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # omarchy:summary=List agent sessions from local session records
-# omarchy:args=[--state <state>] [--mine] [--json]
+# omarchy:args=[--state <state>] [--mine] [--all] [--ended-within <duration>] [--json]
 # omarchy:examples=omarchy agent session list --state waiting --json
 
 set -euo pipefail
 
 # Reads local session.json files only; no Herdr call, so the panel never polls
-# Herdr to render (spec/02-command-surface.md).
+# Herdr to render (spec/02-command-surface.md). --ended-within is the window
+# the panel reads through; without it the list is everything on disk.
 exec omarchy-agent-session-core list "$@"

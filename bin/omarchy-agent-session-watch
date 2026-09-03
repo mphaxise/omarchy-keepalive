@@ -193,7 +193,29 @@ def render_body(kind: str, record: dict, event: Optional[dict] = None) -> str:
     else:
         action = "Click to open"
     head = f"{agent} · {what}" if what else agent
+    # 12-two-people.md: a notification routes to the owner by default; on
+    # one desktop that means naming the owner when it is someone else.
+    owner = ((record.get("owner") or {}).get("actor") or {})
+    local = local_human_id()
+    if owner.get("id") and local and owner.get("id") != local:
+        # The label alone when it is distinct; user@host when it would read
+        # as this person's own name (the run-10 proxy, 2026-09-03).
+        name = owner.get("label") or owner.get("id")
+        if name == local.split("@", 1)[0]:
+            name = owner.get("id")
+        head = f"{head} · owned by {name}"
     return f"{head} · {action}"
+
+
+def local_human_id() -> str:
+    """The same identity rule the core applies (OMARCHY_ACTOR, else
+    user@host), so the watcher and the commands agree on who is local."""
+    override = os.environ.get("OMARCHY_ACTOR")
+    if override:
+        return override.split(":", 1)[1] if ":" in override else override
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
+    host = socket.gethostname().split(".")[0] or "localhost"
+    return f"{user}@{host}"
 
 
 def click_argv(kind: str, session_id: str, record: dict) -> list:

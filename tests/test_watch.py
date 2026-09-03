@@ -215,6 +215,29 @@ class TestCopyAndClickTargets(WatchTestCase):
         sent = self.notifier.sent[-1]
         self.assertEqual(sent["headline"], "api-refactor · tests needs you")
 
+    def test_a_session_owned_by_someone_else_says_so_in_the_body(self):
+        watcher = self.make_watcher()
+        write_session(self.tmpdir, "o1", "handover", agent={"kind": "claude"},
+                      owner={"actor": {"kind": "human", "id": "sam@mac", "label": "sam"}},
+                      goal={"text": "Refactor the API layer"})
+        append_event(self.tmpdir, "o1", 1, "status.changed", {"from": "working", "to": "blocked"})
+        watcher.scan_once(now=self.clock())
+        sent = self.notifier.sent[-1]
+        self.assertIn("owned by sam", sent["description"])
+
+    def test_an_owner_with_the_viewers_own_label_is_named_by_user_and_host(self):
+        # The run-10 proxy: both people are "omarchy", on different hosts.
+        watcher = self.make_watcher()
+        local = watch.local_human_id()
+        me = local.split("@", 1)[0]
+        write_session(self.tmpdir, "o2", "handover", agent={"kind": "claude"},
+                      owner={"actor": {"kind": "human", "id": f"{me}@elsewhere", "label": me}},
+                      goal={"text": "Refactor the API layer"})
+        append_event(self.tmpdir, "o2", 1, "status.changed", {"from": "working", "to": "blocked"})
+        watcher.scan_once(now=self.clock())
+        sent = self.notifier.sent[-1]
+        self.assertIn(f"owned by {me}@elsewhere", sent["description"])
+
     def test_blocked_reads_the_same_as_waiting(self):
         # Herdr reports a question and a permission prompt both as `blocked`,
         # so the title must not guess which; the two stay distinct kinds
@@ -630,3 +653,12 @@ class TestDryRunPrintsArgv(WatchTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPauseIsQuiet(unittest.TestCase):
+    """06-notifications.md: a pause is a person's choice; nothing announces it."""
+
+    def test_status_changed_to_paused_is_not_notify_worthy(self):
+        event = {"type": "status.changed", "data": {"from": "idle", "to": "paused", "detail": "paused"}}
+        self.assertIsNone(watch.classify_event(event))
+        self.assertIsNone(watch.classify_event({"type": "runtime.unbound", "data": {"reason": "paused"}}))

@@ -21,11 +21,14 @@ Subcommands:
   open          attach a terminal to a session
   send          queue or deliver an instruction
   stop          stop a session and, by default, its children
+  pause         pause a session: exit the harness, keep the record, open resumes it
   rename        rename a session
   assign        reassign a session's owner
   goal          set, clear, or show a session's durable goal
   log           print or follow a session's event log
   receipt       print a session's receipt
+  history       ended sessions by day, newest first (default: fourteen days)
+  prune         delete ended session records older than a duration; a dry run unless --yes
   capture       attach a screenshot, file, or URL artifact
   artifact-add  attach an artifact of any kind
   preview       register the running product a session works on

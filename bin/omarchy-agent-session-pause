@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# omarchy:summary=Pause an agent session: exit its harness, keep the session, resume it later with open
+# omarchy:args=<id-or-name> [--lane <name>] [--reason <text>]
+# omarchy:examples=omarchy agent session pause api-refactor --reason "back after the review"
+
+set -euo pipefail
+
+# "I'll be back" (spec/01-session-model.md, 2026-09-03): the pane closes, a
+# checkpoint receipt is written, the worktree stays, and the record waits in
+# the panel's Paused section with no time window until open resumes it.
+exec omarchy-agent-session-core pause "$@"

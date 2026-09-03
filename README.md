@@ -2,7 +2,7 @@
 
 Coding agents that stay running on your Omarchy desktop. Close the terminal and the agent keeps working. Reboot, and the session comes back as orphaned; press Enter and the agent picks up its own transcript where it left off.
 
-Each session shows up in the Omarchy bar. The panel tells you who needs an answer, who is working, and what finished today. When an agent needs you, you get a notification. When a session ends, you get a receipt: the branch, the commits, the diff, the files it made, and your verdict.
+Each session shows up in the Omarchy bar. The panel tells you who needs an answer, who is working, what finished today, and how many finished before that; `e` lists the last two weeks by day. When an agent needs you, you get a notification. When a session ends, you get a receipt: the branch, the commits, the diff, the files it made, and your verdict. Nothing is deleted: a session you stopped last week is still there, with its receipt and its transcript, and Enter resumes it.
 
 ![The Keepalive panel with one session that needs an answer](preview.png)
 
@@ -12,15 +12,19 @@ Herdr, Omarchy's agent runtime, keeps the agent process alive. This plugin keeps
 
 **A bar widget.** A robot icon. It turns red with a badge when a session needs you.
 
-**A panel you can drive from the keyboard.** Arrows move. Enter opens the session, or answers it. `s` sends an instruction. `x` twice stops it. `r` shows the receipt. `p` focuses the session's preview window. `n` starts a new session: type what the agent should do, press Enter, and a terminal opens on it.
+**A panel you can drive from the keyboard.** Arrows move. Enter opens the session, or answers it. `s` sends an instruction. `z` pauses it. `x` twice stops it. `r` shows the receipt. `p` focuses the session's preview window. `n` starts a new session: type what the agent should do, press Enter, and a terminal opens on it. `e` opens History.
+
+**Pause.** `z` on a running session, one press: the agent process exits, the pane closes, the session keeps its transcript, its worktree, and a checkpoint receipt, and it waits in a Paused section of the panel with no time limit. A reboot leaves it there. Enter resumes it on its transcript; `x` twice ends it. Pause is the "I'll be back"; stop is the "done with this".
+
+**History and Resume.** The panel shows what ended in the last day and, under it, how many ended before that ("18 earlier · e"). `e`, or `omarchy-agent-session-history`, lists the last fourteen days by day: when each session ended, how it ended, how long it ran, and whether it resumes; `--days 30` reaches further back. A session you stopped keeps its transcript, so its row says Resume, and Enter starts the agent again on that transcript in the same worktree, putting the worktree back from its branch if the stop had cleaned it up. A session you closed with a verdict stays closed. The bar icon stays as long as any record exists.
 
 **Lanes (0.2.0).** A session can hold more than one agent. Press `a` on a running session, type the task, and a second agent starts in a pane beside the first, on its own git worktree cut from the session's branch. Each lane shows under the session with its state and its task; `w` walks the lanes so Enter, `s`, and `x` act on one of them. A lane that asks a question makes the session need you, with the lane named on the toast and the row. `omarchy-agent-session-done <session> --lane <name> --verdict kept` merges the lane's commits onto the session branch; a conflict shows as a blocked lane and loses nothing. The receipt lists commits per lane. Tested with two Claude Code lanes on one page.
 
-**Twenty-four commands.** All start with `omarchy-agent-session-`. The main ones are `new`, `list`, `open`, `send`, `stop`, `done`, `receipt`, and `show`; `add` and `lanes` are the lane ones. The rest handle names, goals, modes, previews, captures, artifacts, and watchers.
+**Thirty-one commands.** All start with `omarchy-agent-session-`. The main ones are `new`, `list`, `open`, `send`, `pause`, `stop`, `done`, `receipt`, `history`, and `show`; `add` and `lanes` are the lane ones; `prune` is the one that deletes, ended sessions only, a dry run unless you add `--yes`. The rest handle names, goals, modes, previews, captures, artifacts, watchers, and who may see or suggest on a session.
 
 **Notifications.** "api-refactor needs you" when the agent asks a question or a permission. "api-refactor finished" when it is done; click it to see the receipt. "api-refactor stopped unexpectedly" when Herdr loses the process or the machine rebooted; click it to revive.
 
-**Revive.** An orphaned session revives with Enter: the agent starts again with `--resume` on its saved transcript, in the same worktree, with the same goal. Proven with Claude Code on the rig. Whatever tool call the agent was in the middle of is lost; the conversation is kept.
+**Revive.** An orphaned session revives with Enter: the agent starts again with `--resume` on its saved transcript, in the same worktree, with the same goal. Proven with Claude Code on the rig. Whatever tool call the agent was in the middle of is lost; the conversation is kept. A stopped session resumes the same way; the row says Resume instead of Revive, because you were the one who stopped it.
 
 **Permission modes.** Personal: the agent runs without asking. Shared: the agent asks before it acts. Restricted: read-only tools. The plugin checks the launch command before it runs. Only Personal can skip prompts.
 
@@ -61,6 +65,9 @@ omarchy-agent-session-preview api-refactor http://localhost:3000
 omarchy-agent-session-done api-refactor --verdict kept --note "Reviewed the diff, merged"
 omarchy-agent-session-receipt api-refactor
 omarchy-agent-session-show api-refactor --loop  # goal, captures, instructions, commits, verdict, in order
+omarchy-agent-session-history --days 30          # what ended, by day; the panel shows one day
+omarchy-agent-session-pause api-refactor         # I'll be back: the process exits, the session waits
+omarchy-agent-session-prune --older-than 90d     # a dry run; add --yes to delete those records
 ```
 
 `omarchy-shell io.github.mphaxise.keepalive open|close|toggle|refresh|openMostUrgent` controls the panel from a script or a keybinding. `omarchy bar move io.github.mphaxise.keepalive --section left|center|right` moves the widget.
@@ -72,7 +79,7 @@ omarchy-agent-session-show api-refactor --loop  # goal, captures, instructions, 
 omarchy plugin remove io.github.mphaxise.keepalive
 ```
 
-The first command stops and removes the two units and the command links. It keeps your session records in `~/.local/state/omarchy/sessions/`. Delete that folder yourself if you want them gone. Running sessions keep running in Herdr. Stop them first with `omarchy-agent-session-stop` if you want a clean slate.
+The first command stops and removes the two units and the command links. It keeps your session records in `~/.local/state/omarchy/sessions/`. `omarchy-agent-session-prune --older-than 30d --yes` deletes the ended ones older than that; delete the folder yourself if you want all of them gone. Running sessions keep running in Herdr. Stop them first with `omarchy-agent-session-stop` if you want a clean slate.
 
 ## What it writes
 
@@ -92,7 +99,7 @@ That is the full list. It writes nothing to `/usr`, your project files, or Omarc
 
 ## Source
 
-This plugin is the installable part of [omarchy-multiplayer](https://github.com/mphaxise/omarchy-multiplayer). That repo has the specs, the test runs with screenshots, and the decision log. Run the tests with `python3 -m unittest discover -s tests`: 155 tests, standard library only.
+This plugin is the installable part of [omarchy-multiplayer](https://github.com/mphaxise/omarchy-multiplayer). That repo has the specs, the test runs with screenshots, and the decision log. Run the tests with `python3 -m unittest discover -s tests`: 186 tests, standard library only.
 
 ## Credits
 

@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# omarchy:summary=Accept, or --dismiss, a suggestion waiting on a session
+# omarchy:args=<id-or-name> [oldest|latest|<instruction-id>] [--dismiss]
+# omarchy:examples=omarchy agent session accept api-refactor
+
+set -euo pipefail
+
+# Defined in spec/12-two-people.md.
+exec omarchy-agent-session-core accept "$@"

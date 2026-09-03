@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# omarchy:summary=Delete ended agent session records; a dry run unless --yes
+# omarchy:args=(--older-than <duration> | --session <id-or-name>) [--yes] [--json]
+# omarchy:examples=omarchy agent session prune --older-than 90d
+
+set -euo pipefail
+
+# The one deletion in the model (spec/01-session-model.md, Retention): ended
+# sessions only, never a live, orphaned, or paused one, never scheduled, and
+# nothing is deleted until --yes is given.
+exec omarchy-agent-session-core prune "$@"

@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# omarchy:summary=Ended agent sessions by day, newest first, from local session records
+# omarchy:args=[--days <n>] [--all] [--json] [--pager]
+# omarchy:examples=omarchy agent session history --days 30
+
+set -euo pipefail
+
+# The panel shows what ended in the last day; the record keeps everything.
+# This is the surface for the rest (spec/02-command-surface.md, spec/01
+# Retention). No Herdr call.
+exec omarchy-agent-session-core history "$@"

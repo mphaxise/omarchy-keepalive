@@ -72,7 +72,7 @@ class ConflictError(SessionError):
 # --------------------------------------------------------------------------
 
 STATES = (
-    "starting", "working", "waiting", "blocked", "idle",
+    "starting", "working", "waiting", "blocked", "idle", "paused",
     "done", "failed", "stopped", "orphaned",
 )
 TERMINAL_STATES = {"done", "failed", "stopped"}
@@ -86,7 +86,16 @@ EVENT_TYPES = (
     "approval.requested", "approval.resolved", "artifact.added",
     "receipt.written", "session.ended",
     "lane.added", "lane.merged", "artifact.updated",
+    "session.visibility_changed", "access.granted", "access.revoked",
+    "suggestion.accepted", "suggestion.dismissed",
 )
+
+# 12-two-people.md: who may see and act on a session. `owner` stays who is
+# responsible; `access` is who may act at all and how much. The creator
+# and the owner hold `own` without an entry.
+VISIBILITIES = ("private", "draft", "shared")
+ACCESS_LEVELS = ("view", "suggest", "contribute", "own")
+ACCESS_RANK = {level: i for i, level in enumerate(ACCESS_LEVELS)}
 
 # 11-agent-lanes.md: a lane is one agent with one task inside a session,
 # recorded as a child session with spawn_reason "lane". The session's own
@@ -269,14 +278,71 @@ def atomic_write_json(path, obj):
 ACTOR_KINDS = ("human", "agent", "system")
 
 
+_HUMAN_ACTOR_CACHE = {}
+
+
 def current_human_actor():
+    """human:<user>@<host>, unverified and machine-local (08-identity-and-
+    attribution.md). Slice 3's second identity space, in proxy form:
+    OMARCHY_ACTOR names the actor outright, and a command that arrives over
+    ssh reports the client host instead of this one, so the same OS user
+    driving the rig from another machine is a distinguishable actor. The
+    trust boundary is unchanged: anyone on this machine can set either.
+    Cached per process: the reverse lookup behind SSH_CONNECTION would
+    otherwise run once per session on every `list`."""
+    key = (os.environ.get("OMARCHY_ACTOR"), os.environ.get("SSH_CONNECTION"), os.environ.get("SSH_CLIENT"),
+           os.environ.get("USER"), os.environ.get("LOGNAME"))
+    cached = _HUMAN_ACTOR_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
+    actor = _compute_human_actor()
+    _HUMAN_ACTOR_CACHE[key] = dict(actor)
+    return actor
+
+
+def _compute_human_actor():
+    override = os.environ.get("OMARCHY_ACTOR")
+    if override:
+        with contextlib.suppress(UsageError):
+            actor = parse_actor_string(override if ":" in override else f"human:{override}")
+            if actor["kind"] == "human":
+                return actor
     user = os.environ.get("USER") or os.environ.get("LOGNAME")
     if not user:
         with contextlib.suppress(Exception):
             user = getpass.getuser()
     user = user or "unknown"
     host = socket.gethostname().split(".")[0] or "localhost"
+    ssh = os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT")
+    if ssh:
+        client = ssh.split()[0]
+        with contextlib.suppress(Exception):
+            client = socket.gethostbyaddr(client)[0].split(".")[0] or client
+        host = client
     return {"kind": "human", "id": f"{user}@{host}", "label": user}
+
+
+def same_actor(a, b):
+    return bool(a) and bool(b) and a.get("kind") == b.get("kind") and a.get("id") == b.get("id")
+
+
+def display_name(actor, viewer=None):
+    """A person's name for a surface: the label, or user@host when the
+    label would read as the viewer's own name for someone else. The run-10
+    proxy's two identities are both the OS user "omarchy" (2026-09-03), and
+    two accounts that share a first name collide the same way."""
+    if not actor:
+        return "?"
+    label = actor.get("label") or actor.get("id") or "?"
+    if actor.get("kind") != "human":
+        return label
+    if viewer is None:
+        viewer = current_human_actor()
+    if same_actor(actor, viewer):
+        return label
+    if (viewer.get("label") or "") == label:
+        return actor.get("id") or label
+    return label
 
 
 def system_actor():
@@ -679,7 +745,10 @@ class HerdrClient:
                                                     "args": list(flags or []), "timeout_ms": timeout_ms}) or {}
                 break
             except HerdrError as e:
-                if "not an available shell" in str(e) and attempt < 19:
+                # "pane … not found" for a pane Herdr just reported (run 10,
+                # 2026-09-03, right after a shell restart) is the same
+                # not-yet-ready condition as the shell one.
+                if ("not an available shell" in str(e) or "not found" in str(e)) and attempt < 19:
                     time.sleep(0.5)
                     continue
                 raise
@@ -1048,6 +1117,8 @@ class SessionStore:
             eprint(f"session {session_id}: events.jsonl reached {seq} rows; this session should end")
         if watch_material(event):
             notify_watchers(self, session_id, event)
+        if event_type == "session.ended":
+            clear_presence(session_id)   # nobody is "here" on an ended session
         return event
 
     def read_events(self, session_id, since=None, type_filter=None):
@@ -1313,9 +1384,25 @@ def compute_receipt(store, session, end_state=None, end_reason=None, ended_at=No
                       "task": d.get("task"), "end_state": cst.get("state"), "detail": cst.get("detail"),
                       "merged_commits": (merged or {}).get("commits") or [], "range": (merged or {}).get("range")})
 
+    # 12-two-people.md: who could act on the session and what the second
+    # person put forward, so the receipt reads the same to both of them.
+    suggested = [e for e in events if e["type"] == "instruction.queued" and (e.get("data") or {}).get("delivery") == "suggested"]
+    accepted = [e for e in events if e["type"] == "suggestion.accepted"]
+    dismissed = [e for e in events if e["type"] == "suggestion.dismissed"]
+    people = {
+        "access": [{"actor": g.get("actor"), "level": g.get("level")} for g in (session.get("access") or [])],
+        "assigned": [{"from": e["data"].get("from"), "to": e["data"].get("to"), "by": e.get("actor"), "at": e["ts"]}
+                     for e in events if e["type"] == "owner.assigned"],
+        "suggestions": {"made": len(suggested), "accepted": len(accepted), "dismissed": len(dismissed),
+                        "waiting": len(pending_suggestions(session)),
+                        "authors": sorted({actor_to_string(e["actor"]) for e in suggested if e.get("actor")})},
+        "visibility": session_visibility(session),
+    }
+
     return {
         "session_id": session["id"], "name": session["name"], "agent": session["agent"],
         "owner": session["owner"]["actor"], "created_by": session["created_by"],
+        "people": people,
         "started_at": started_at, "ended_at": ended_at, "duration_s": duration_s,
         "end_state": end_state, "end_reason": end_reason,
         "started_with": session["started_with"], "goal": session.get("goal"),
@@ -1391,6 +1478,17 @@ def render_receipt_text(receipt):
         for l in lanes:
             merged = f"{len(l['merged_commits'])} commit(s) merged ({l['range']})" if l.get("merged_commits") else "nothing merged"
             lines.append(f"  {l['lane']:<12} {l.get('kind') or '?':<9} {l.get('end_state') or '?':<9} {merged}   {l.get('task') or ''}")
+    people = receipt.get("people")
+    if people:
+        lines.append("")
+        lines.append(f"People     visibility {people.get('visibility')}")
+        for g in people.get("access") or []:
+            lines.append(f"  {actor_to_string(g['actor']) if isinstance(g.get('actor'), dict) else g.get('actor')}   {g.get('level')}")
+        for a in people.get("assigned") or []:
+            lines.append(f"  assigned {actor_to_string(a['from']) if isinstance(a.get('from'), dict) else a.get('from')} -> {actor_to_string(a['to']) if isinstance(a.get('to'), dict) else a.get('to')}   {a.get('at')}")
+        sg = people.get("suggestions") or {}
+        if sg.get("made"):
+            lines.append(f"  suggestions {sg.get('made')} made, {sg.get('accepted')} accepted, {sg.get('dismissed')} dismissed, {sg.get('waiting')} waiting ({', '.join(sg.get('authors') or [])})")
     lines.append("")
     lines.append(f"Receipt    state_version {receipt['state_version']}")
     return "\n".join(lines)
@@ -1509,6 +1607,7 @@ def new_session_record(session_id, name, created_by, owner, mode, agent_kind, wo
         "lineage": {"parent_id": parent_id, "children": [], "spawn_reason": spawn_reason},
         "goal": {"text": goal_text, "set_by": created_by, "set_at": now} if goal_text else None,
         "queue": [], "state_version": 0, "labels": [], "preview": None,
+        "visibility": "shared", "access": [],
         "started_with": {"command": command, "cwd": cwd, "env_summary": summarize_env()},
     }
 
@@ -1554,8 +1653,24 @@ def build_parser():
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("list")
+    p.add_argument("--all", action="store_true", help="include drafts and private sessions you were not given access to")
     p.add_argument("--state", choices=STATES)
     p.add_argument("--mine", action="store_true")
+    p.add_argument("--ended-within", metavar="DURATION",
+                   help="keep every live or orphaned session and only the ended ones that ended within DURATION (90m, 24h, 14d); --json then reports how many ended earlier")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("history", help="ended sessions by day, newest first (the panel shows one day; this shows fourteen)")
+    p.add_argument("--days", type=int, default=14)
+    p.add_argument("--all", action="store_true", help="include private sessions someone else owns")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--pager", action="store_true", help="pipe through `less -R` (prints plainly when less is missing)")
+
+    p = sub.add_parser("prune", help="delete ended session records: a dry run unless --yes; never a live, orphaned, or paused session")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--older-than", metavar="DURATION", help="ended sessions that ended more than DURATION ago (30d; at least 1d)")
+    g.add_argument("--session", metavar="ID_OR_NAME", help="one ended session")
+    p.add_argument("--yes", action="store_true", help="delete; without it, print what would be deleted")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("show")
@@ -1578,6 +1693,26 @@ def build_parser():
     p.add_argument("--direction", default="right", choices=["right", "down"], help="where the lane's pane splits from the session's")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("visibility", help="private, draft, or shared (12-two-people.md)")
+    add_id_arg(p)
+    p.add_argument("visibility", choices=list(VISIBILITIES))
+
+    p = sub.add_parser("grant", help="give another actor view, suggest, contribute, or own access; --revoke takes it away")
+    add_id_arg(p)
+    p.add_argument("--to", required=True, help="human:<user>@<host>, or <user>@<host>")
+    p.add_argument("--level", choices=list(ACCESS_LEVELS), default="suggest")
+    p.add_argument("--revoke", action="store_true")
+
+    p = sub.add_parser("accept", help="accept (or --dismiss) a suggestion waiting on the session")
+    add_id_arg(p)
+    p.add_argument("suggestion", nargs="?", help="an instruction id, 'oldest' (default), or 'latest'")
+    p.add_argument("--dismiss", action="store_true")
+
+    p = sub.add_parser("presence", help="who has the session open right now; --here and --leave mark yourself")
+    add_id_arg(p)
+    p.add_argument("--here", action="store_true")
+    p.add_argument("--leave", action="store_true")
+
     p = sub.add_parser("artifact-mark", help="relabel an artifact proposed or live (05-receipts-and-artifacts.md)")
     add_id_arg(p)
     p.add_argument("artifact", help="label, path, or id prefix")
@@ -1596,6 +1731,7 @@ def build_parser():
     add_id_arg(p)
     p.add_argument("text")
     p.add_argument("--lane", help="one lane; without it a session with lanes fans out to every live lane")
+    p.add_argument("--suggest", action="store_true", help="queue it for the owner to accept or dismiss (12-two-people.md)")
     p.add_argument("--from", dest="from_session")
     p.add_argument("--about", dest="about_artifact")
     p.add_argument("--with-capture", action="store_true",
@@ -1609,6 +1745,11 @@ def build_parser():
     p.add_argument("--keep-children", action="store_true")
     p.add_argument("--keep-lanes", action="store_true", help="stop the session's own agent and leave its lanes running")
     p.add_argument("--lane", help="stop one lane only")
+    p.add_argument("--reason")
+
+    p = sub.add_parser("pause", help="I'll be back: exit the harness, keep the session, resume it later with open")
+    add_id_arg(p)
+    p.add_argument("--lane", help="pause one lane only")
     p.add_argument("--reason")
 
     p = sub.add_parser("rename")
@@ -1711,6 +1852,7 @@ def session_project(s):
 
 def session_list_entry(s):
     status = s["status"]
+    viewer = current_human_actor()
     created_by = s.get("created_by") or {}
     ref = s["agent"].get("harness_session_ref")
     return {
@@ -1727,6 +1869,9 @@ def session_list_entry(s):
         "goal": goal_first_line(s.get("goal")),
         "mode": s["mode"],
         "resumable": isinstance(ref, str) and bool(ref),
+        # Whether `open` brings it back, decided here and nowhere else
+        # (02-command-surface.md, 2026-09-03).
+        "revivable": session_revivable(s),
         "created_by": {"kind": created_by.get("kind"), "label": created_by.get("label")},
         "project": session_project(s),
         # 09-closed-loop-surfaces.md section 7: the registered preview and
@@ -1738,6 +1883,14 @@ def session_list_entry(s):
         "lane": ({"name": s["lane"]["name"], "parent_id": s["lane"]["parent_id"], "parent_name": s["lane"].get("parent_name")}
                  if is_lane(s) else None),
         "lanes": [],
+        # 12-two-people.md: names as the caller should read them, and who
+        # owns the session when that is someone else (null when it is you).
+        "visibility": session_visibility(s),
+        "owner_display": display_name(s["owner"]["actor"], viewer),
+        "owned_by_other": (None if same_actor(s["owner"]["actor"], viewer) else display_name(s["owner"]["actor"], viewer)),
+        "suggestions": [{"id": q["id"], "author": q.get("author"), "author_display": display_name(q.get("author"), viewer),
+                         "text": q.get("text"), "queued_at": q.get("queued_at")} for q in pending_suggestions(s)],
+        "presence": read_presence(s["id"]) if status["state"] not in TERMINAL_STATES else [],
     }
 
 
@@ -1885,6 +2038,165 @@ def cmd_new(args, ctx):
         print(json.dumps(record, indent=2))
     else:
         print(session_id)
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# Two people (12-two-people.md): visibility, access, suggestions, presence
+# --------------------------------------------------------------------------
+
+def session_visibility(session):
+    return session.get("visibility") or "shared"
+
+
+def access_level_of(session, actor):
+    """The actor's level on the session: own for the creator and the owner,
+    the granted level otherwise, view when the session is shared, None when
+    the actor may not see it at all."""
+    if same_actor(session.get("created_by"), actor) or same_actor((session.get("owner") or {}).get("actor"), actor):
+        return "own"
+    for grant in session.get("access") or []:
+        if same_actor(grant.get("actor"), actor):
+            return grant.get("level")
+    if session_visibility(session) == "shared":
+        return "view"
+    return None
+
+
+def can_see(session, actor):
+    return access_level_of(session, actor) is not None
+
+
+def require_access(session, actor, level):
+    have = access_level_of(session, actor)
+    if have is None or ACCESS_RANK[have] < ACCESS_RANK[level]:
+        raise ConflictError(f"{actor_to_string(actor)} has {have or 'no'} access to '{session['name']}'; {level} is needed")
+    return have
+
+
+def cmd_visibility(args, ctx):
+    session = ctx.store.load(args.id_or_name)
+    actor = current_human_actor()
+    require_access(session, actor, "own")
+    old = session_visibility(session)
+    if args.visibility == old:
+        print(f"{session['name']}: {old}")
+        return EXIT_OK
+    ev = ctx.store.append_event(session["id"], "session.visibility_changed", actor, {"from": old, "to": args.visibility})
+    session["visibility"] = args.visibility
+    session["state_version"] = ev["seq"]
+    ctx.store.save_session(session)
+    print(f"{session['name']}: {old} -> {args.visibility}")
+    return EXIT_OK
+
+
+def cmd_grant(args, ctx):
+    session = ctx.store.load(args.id_or_name)
+    actor = current_human_actor()
+    require_access(session, actor, "own")
+    target = parse_actor_string(args.to if ":" in args.to else f"human:{args.to}")
+    access = [g for g in (session.get("access") or []) if not same_actor(g.get("actor"), target)]
+    if args.revoke:
+        ev = ctx.store.append_event(session["id"], "access.revoked", actor, {"actor": target})
+        print(f"{actor_to_string(target)}: access revoked on {session['name']}")
+    else:
+        access.append({"actor": target, "level": args.level, "granted_by": actor, "granted_at": now_rfc3339()})
+        ev = ctx.store.append_event(session["id"], "access.granted", actor, {"actor": target, "level": args.level})
+        print(f"{actor_to_string(target)}: {args.level} on {session['name']}")
+    session["access"] = access
+    session["state_version"] = ev["seq"]
+    ctx.store.save_session(session)
+    return EXIT_OK
+
+
+def pending_suggestions(session):
+    return [q for q in session.get("queue") or [] if q.get("delivery") == "suggested"]
+
+
+def cmd_accept(args, ctx):
+    """The owner accepts a suggestion: it becomes a steer instruction from
+    its author, delivered now, with the acceptance recorded as its own
+    attributed event."""
+    session = ctx.store.load(args.id_or_name)
+    actor = current_human_actor()
+    require_access(session, actor, "own")
+    pending = pending_suggestions(session)
+    if not pending:
+        raise NotFoundError(f"no suggestions waiting on '{session['name']}'")
+    chosen = pending[0] if args.suggestion in (None, "", "latest", "oldest") else next((q for q in pending if q["id"] == args.suggestion), None)
+    if args.suggestion == "latest":
+        chosen = pending[-1]
+    if chosen is None:
+        raise NotFoundError(f"no suggestion '{args.suggestion}' on '{session['name']}'")
+    if args.dismiss:
+        ev = ctx.store.append_event(session["id"], "suggestion.dismissed", actor,
+                                     {"instruction_id": chosen["id"], "author": chosen["author"], "text": chosen["text"]})
+        session["queue"] = [q for q in session["queue"] if q["id"] != chosen["id"]]
+        session["state_version"] = ev["seq"]
+        ctx.store.save_session(session)
+        print(f"dismissed: {chosen['text']}")
+        return EXIT_OK
+    ev = ctx.store.append_event(session["id"], "suggestion.accepted", actor,
+                                 {"instruction_id": chosen["id"], "author": chosen["author"], "text": chosen["text"]})
+    session["queue"] = [q for q in session["queue"] if q["id"] != chosen["id"]]
+    session["state_version"] = ev["seq"]
+    ctx.store.save_session(session)
+    send_args = argparse.Namespace(id_or_name=session["id"], text=chosen["text"], from_session=None, about_artifact=chosen.get("about_artifact"),
+                                   wait=False, until=[], timeout=None, lane=None, with_capture=False, suggest=False,
+                                   author_override=chosen["author"], accepted_by=actor)
+    return cmd_send(send_args, ctx)
+
+
+PRESENCE_TTL_S = 600
+
+
+def presence_dir(session_id):
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return pathlib.Path(base) / "omarchy-sessions" / "presence" / session_id
+
+
+def touch_presence(session_id, actor):
+    """Presence lives in the runtime directory only: who has a terminal or
+    a panel on the session right now. Never written to the record, gone
+    with the session's runtime dir (08-identity-and-attribution.md)."""
+    with contextlib.suppress(OSError):
+        d = presence_dir(session_id)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / actor_to_string(actor).replace("/", "_")).write_text(now_rfc3339() + "\n", encoding="utf-8")
+
+
+def leave_presence(session_id, actor):
+    with contextlib.suppress(OSError):
+        (presence_dir(session_id) / actor_to_string(actor).replace("/", "_")).unlink()
+
+
+def clear_presence(session_id):
+    with contextlib.suppress(OSError):
+        shutil.rmtree(presence_dir(session_id), ignore_errors=True)
+
+
+def read_presence(session_id):
+    out = []
+    d = presence_dir(session_id)
+    if not d.exists():
+        return out
+    now = time.time()
+    for f in sorted(d.iterdir()):
+        with contextlib.suppress(OSError):
+            if now - f.stat().st_mtime <= PRESENCE_TTL_S:
+                out.append(f.name)
+    return out
+
+
+def cmd_presence(args, ctx):
+    session = ctx.store.load(args.id_or_name)
+    actor = current_human_actor()
+    if args.leave:
+        leave_presence(session["id"], actor)
+    elif args.here:
+        touch_presence(session["id"], actor)
+    for who in read_presence(session["id"]):
+        print(who)
     return EXIT_OK
 
 
@@ -2287,6 +2599,40 @@ def notify_parent_of_completion(store, herdr, child, end_state, reason):
         cmd_send(send_args, Context(store, herdr))
 
 
+_DURATION_RE = re.compile(r"^(\d+)([mhd])$")
+_DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration(text):
+    """`90m`, `24h`, `14d` to seconds; anything else is a usage error."""
+    m = _DURATION_RE.match(str(text or "").strip())
+    if not m:
+        raise UsageError(f"a duration is an integer and m, h, or d (for example 24h), not '{text}'")
+    return int(m.group(1)) * _DURATION_UNITS[m.group(2)]
+
+
+def ended_at(session):
+    """When an ended session ended, as a datetime, from `status.since`;
+    None for a live session or an unreadable timestamp."""
+    if session["status"]["state"] not in TERMINAL_STATES:
+        return None
+    try:
+        return parse_rfc3339(session["status"]["since"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def in_window(session, cutoff):
+    """The panel's window (02-command-surface.md, `--ended-within`): every
+    live or orphaned session, plus the ended ones that ended at or after
+    `cutoff`. An ended session with no readable end time stays visible
+    rather than silently leaving."""
+    when = ended_at(session)
+    if session["status"]["state"] not in TERMINAL_STATES:
+        return True
+    return when is None or when >= cutoff
+
+
 def cmd_list(args, ctx):
     sessions = ctx.store.list_sessions()
     if args.state:
@@ -2295,10 +2641,28 @@ def cmd_list(args, ctx):
         me = current_human_actor()
         sessions = [s for s in sessions if s["owner"]["actor"].get("id") == me["id"]]
     sessions.sort(key=lambda s: s["created_at"])
+    # 12-two-people.md: a draft or private session shows only to those
+    # with access; --all overrides for the person at the machine.
+    me = current_human_actor()
+    if not getattr(args, "all", False):
+        sessions = [s for s in sessions if can_see(s, me)]
+    # The window a surface reads through. The store keeps everything
+    # (01-session-model.md, Retention); the surface says how much it wants,
+    # and hears how much lies outside that (2026-09-03: 52 records, 53 KB
+    # against the panel's 64 KB cap).
+    window = None
+    if getattr(args, "ended_within", None):
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=parse_duration(args.ended_within))
+        earlier = sum(1 for s in sessions if not in_window(s, cutoff) and not is_lane(s))
+        sessions = [s for s in sessions if in_window(s, cutoff)]
+        window = {"ended_within": args.ended_within, "earlier_ended": earlier}
     everything = ctx.store.list_sessions()
     entries = attach_lane_entries([session_list_entry(s) for s in sessions], everything)
     if args.json:
-        print(json.dumps({"sessions": entries}, indent=2))
+        payload = {"sessions": entries}
+        if window is not None:
+            payload["window"] = window
+        print(json.dumps(payload, indent=2))
         return EXIT_OK
     for entry in entries:
         flag = "!" if entry["needs_attention"] else " "
@@ -2363,6 +2727,7 @@ def render_loop_text(store, session):
     lines.append("")
 
     events = store.read_events(session["id"])
+    viewer = current_human_actor()
     # Artifact labels by path, so an instruction's `about` reads as a label.
     artifacts = read_artifacts_index(store.artifacts_dir(session["id"]))
     label_by_path = {a.get("path"): a.get("label") for a in artifacts}
@@ -2385,9 +2750,28 @@ def render_loop_text(store, session):
         ts = e["ts"]
         if t == "instruction.queued":
             about = about_label(d.get("about_artifact"))
-            who = (e.get("actor") or {}).get("label") or (e.get("actor") or {}).get("id") or "?"
+            who = display_name(e.get("actor"), viewer)
             text = (d.get("text") or "").strip().splitlines()[0] if d.get("text") else ""
-            rows.append((ts, int(e.get("seq") or 0), f"instruction  {who}: {text}" + (f"  [about: {about}]" if about else "")))
+            tail = f"  [about: {about}]" if about else ""
+            if d.get("delivery") == "suggested":
+                # 12-two-people.md: a suggestion waits; the acceptance below
+                # is what runs it, under the suggester's name.
+                rows.append((ts, int(e.get("seq") or 0), f"suggested    {who}: {text}{tail}"))
+            elif d.get("accepted_by"):
+                rows.append((ts, int(e.get("seq") or 0), f"instruction  {who}: {text}{tail}  [accepted by {display_name(d.get('accepted_by'), viewer)}]"))
+            else:
+                rows.append((ts, int(e.get("seq") or 0), f"instruction  {who}: {text}{tail}"))
+        elif t == "suggestion.dismissed":
+            text = (d.get("text") or "").strip().splitlines()[0] if d.get("text") else ""
+            rows.append((ts, int(e.get("seq") or 0), f"dismissed    {display_name(e.get('actor'), viewer)} dismissed {display_name(d.get('author'), viewer)}: {text}"))
+        elif t == "access.granted":
+            rows.append((ts, int(e.get("seq") or 0), f"access       {display_name(d.get('actor'), viewer)} may {d.get('level')} (by {display_name(e.get('actor'), viewer)})"))
+        elif t == "access.revoked":
+            rows.append((ts, int(e.get("seq") or 0), f"access       {display_name(d.get('actor'), viewer)} revoked (by {display_name(e.get('actor'), viewer)})"))
+        elif t == "owner.assigned":
+            rows.append((ts, int(e.get("seq") or 0), f"owner        {display_name(d.get('from'), viewer)} -> {display_name(d.get('to'), viewer)} (by {display_name(e.get('actor'), viewer)})"))
+        elif t == "session.visibility_changed":
+            rows.append((ts, int(e.get("seq") or 0), f"visibility   {d.get('from')} -> {d.get('to')} (by {display_name(e.get('actor'), viewer)})"))
         elif t == "instruction.dropped":
             rows.append((ts, int(e.get("seq") or 0), f"dropped      {d.get('reason')}"))
         elif t == "artifact.added":
@@ -2459,14 +2843,67 @@ def inferred_exit_revivable(session):
             and bool(session["agent"].get("harness_session_ref")))
 
 
+def stop_revivable(session):
+    """A session a person stopped, with a transcript to resume. Stop reads
+    as "stop for now" to the person who pressed it (Praneet, 2026-09-03:
+    six sessions from the evening before, all stopped by hand, none
+    reachable), so `open` resumes it the way an orphan resumes. A `done`
+    closed with a verdict stays closed: a verdict is a decision, a stop is
+    a pause (01-session-model.md, 2026-09-03)."""
+    return (session["status"]["state"] == "stopped"
+            and bool(session["agent"].get("harness_session_ref")))
+
+
+def session_revivable(session):
+    """True exactly when `open` would bring the session back rather than
+    refuse it. Computed here and carried in `list --json` as `revivable`,
+    so no surface re-derives the rule (02-command-surface.md)."""
+    return (session["status"]["state"] in ("orphaned", "paused")
+            or inferred_exit_revivable(session)
+            or stop_revivable(session))
+
+
+def restore_worktree_if_missing(session):
+    """`stop` runs 07-worktrees.md's cleanup, which removes a merged or
+    pushed worktree the session's own `new` created; the branch survives
+    (invariant 7). A harness resumes its transcript by working directory,
+    so a resume after that cleanup puts the worktree back at the recorded
+    path from the recorded branch. Returns True when it did."""
+    ws = session.get("workspace") or {}
+    path = ws.get("worktree_path")
+    if not path or pathlib.Path(path).exists():
+        return False
+    if not (ws.get("created_by_session") and ws.get("repo_root") and ws.get("branch")):
+        raise ConflictError(f"session {session['id']} worked in {path}, which no longer exists; nothing to resume in")
+    r = run_git(["worktree", "add", str(path), ws["branch"]], cwd=ws["repo_root"], check=False)
+    if r.returncode != 0:
+        raise ConflictError(f"session {session['id']}: could not re-create its worktree at {path} from {ws['branch']}: {r.stderr.strip()}")
+    ws["worktree_removed"] = False
+    ws["worktree_removed_reason"] = None
+    session["workspace"] = ws
+    return True
+
+
 def cmd_open(args, ctx):
     session = ctx.store.load(args.id_or_name)
     if getattr(args, "lane", None):
         session = resolve_lane(ctx.store, session, args.lane)
     actor = current_human_actor()
+    require_access(session, actor, "contribute")
+    touch_presence(session["id"], actor)
     state = session["status"]["state"]
     runtime = session.get("runtime")
 
+    if state == "starting" and runtime is None:
+        # Created, never bound: Herdr refused the start (run 10, 2026-09-03).
+        # Enter starts it fresh, the way an orphan without a transcript does.
+        detail = "started again after a refused start"
+        ev = ctx.store.append_event(session["id"], "status.changed", actor,
+                                     {"from": state, "to": "orphaned", "source": "omarchy", "detail": detail})
+        session["status"] = {"state": "orphaned", "since": ev["ts"], "source": "omarchy", "detail": detail}
+        session["state_version"] = ev["seq"]
+        ctx.store.save_session(session)
+        state = "orphaned"
     if inferred_exit_revivable(session):
         detail = "reopened after an inferred exit"
         ev = ctx.store.append_event(session["id"], "status.changed", actor,
@@ -2475,8 +2912,22 @@ def cmd_open(args, ctx):
         session["state_version"] = ev["seq"]
         ctx.store.save_session(session)
         state = "orphaned"
+    elif stop_revivable(session):
+        # A stop is a pause (01-session-model.md, 2026-09-03): the record
+        # keeps the stop's receipt, and the session goes on from its
+        # transcript through the orphan path below.
+        restored = restore_worktree_if_missing(session)
+        detail = "resumed after a stop" + ("; worktree re-created" if restored else "")
+        ev = ctx.store.append_event(session["id"], "status.changed", actor,
+                                     {"from": state, "to": "orphaned", "source": "omarchy", "detail": detail})
+        session["status"] = {"state": "orphaned", "since": ev["ts"], "source": "omarchy", "detail": detail}
+        session["state_version"] = ev["seq"]
+        ctx.store.save_session(session)
+        state = "orphaned"
 
-    if state == "orphaned":
+    if state in ("orphaned", "paused"):
+        # `paused` takes the same path (01-session-model.md, 2026-09-03):
+        # no pane, a transcript to resume, the worktree still there.
         ref = session["agent"].get("harness_session_ref")
         worktree_path = (session.get("workspace") or {}).get("worktree_path")
         argv, env, _cell = assemble_launch(session["agent"]["kind"], session["mode"])
@@ -2497,7 +2948,7 @@ def cmd_open(args, ctx):
         session["runtime"] = new_runtime
         session["state_version"] = ev["seq"]
         ev = ctx.store.append_event(session["id"], "status.changed", actor,
-                                     {"from": "orphaned", "to": "working", "source": "omarchy", "detail": detail})
+                                     {"from": state, "to": "working", "source": "omarchy", "detail": detail})
         session["status"] = {"state": "working", "since": ev["ts"], "source": "omarchy", "detail": detail}
         session["state_version"] = ev["seq"]
         ctx.store.save_session(session)
@@ -2523,8 +2974,8 @@ def cmd_open(args, ctx):
         # browser costs nothing here.
         with contextlib.suppress(Exception):
             focus_preview(session)
-    elif state != "orphaned":
-        raise ConflictError(f"session {session['id']} has no runtime and is not orphaned; nothing to open")
+    elif state not in ("orphaned", "paused"):
+        raise ConflictError(f"session {session['id']} has no runtime and is not orphaned or paused; nothing to open")
     return EXIT_OK
 
 
@@ -2561,6 +3012,20 @@ def wait_interactive_ready(herdr, alias, timeout_s=30.0, step_s=0.5):
 
 def cmd_send(args, ctx):
     session = ctx.store.load(args.id_or_name)
+    me = current_human_actor()
+    if getattr(args, "suggest", False):
+        # 12-two-people.md: a suggestion sits until the owner accepts or
+        # dismisses it; it never runs on its own.
+        require_access(session, me, "suggest")
+        instr = new_instruction(args.text, me, delivery="suggested", about_artifact=args.about_artifact)
+        ev = ctx.store.append_event(session["id"], "instruction.queued", me, instr)
+        session["queue"].append(instr)
+        session["state_version"] = ev["seq"]
+        ctx.store.save_session(session)
+        print(instr["id"])
+        return EXIT_OK
+    if not args.from_session and not getattr(args, "author_override", None):
+        require_access(session, me, "contribute")
     lane = getattr(args, "lane", None)
     if lane:
         return _send_one(resolve_lane(ctx.store, session, lane), args, ctx)
@@ -2600,12 +3065,17 @@ def _send_one(session, args, ctx):
         origin_name = origin["name"] if origin else args.from_session
         author = agent_actor(args.from_session, label=origin_name)
         delivered_text = format_marked_instruction(args.from_session, origin_name, args.text)
+    elif getattr(args, "author_override", None):
+        author = args.author_override          # an accepted suggestion keeps its author
+        delivered_text = args.text
     else:
         author = current_human_actor()
         delivered_text = args.text
 
     instr = new_instruction(args.text, author, delivery="steer",
                              origin_session=args.from_session, about_artifact=args.about_artifact)
+    if getattr(args, "accepted_by", None):
+        instr["accepted_by"] = args.accepted_by
     ev = ctx.store.append_event(session["id"], "instruction.queued", author, instr)
     session["queue"].append(instr)
     session["state_version"] = ev["seq"]
@@ -2742,6 +3212,7 @@ def _stop_one(session_id, store, herdr, actor, reason):
 def cmd_stop(args, ctx):
     session = ctx.store.load(args.id_or_name)
     actor = current_human_actor()
+    require_access(session, actor, "own")
     reason = args.reason or "stopped"
     if getattr(args, "lane", None):
         _stop_one(resolve_lane(ctx.store, session, args.lane)["id"], ctx.store, ctx.herdr, actor, reason)
@@ -2750,6 +3221,164 @@ def cmd_stop(args, ctx):
         for child_id in list(session["lineage"]["children"]):
             _stop_one(child_id, ctx.store, ctx.herdr, actor, "parent_stopped")
     _stop_one(session["id"], ctx.store, ctx.herdr, actor, reason)
+    return EXIT_OK
+
+
+def _pause_one(session_id, store, herdr, actor, reason):
+    """"I'll be back" (01-session-model.md, 2026-09-03): the harness exits,
+    the pane closes, the record and the worktree stay, a checkpoint receipt
+    says what the session has produced so far. Nothing ends, so no
+    session.ended, no cleanup table, no completion path to the parent.
+    An ended session is left alone (the caller decides whether that is a
+    conflict); a paused one is a no-op."""
+    session = store.try_load(session_id)
+    if session is None:
+        return None
+    state = session["status"]["state"]
+    if state in TERMINAL_STATES or state == "paused":
+        return state
+    runtime = session.get("runtime")
+    # Record first, close the pane second, for the same reason `stop`
+    # does: a pane closed before the record says so reads as an orphan for
+    # one reconciler tick.
+    ev = store.append_event(session_id, "status.changed", actor, {"from": state, "to": "paused", "source": actor["kind"], "detail": reason})
+    session["status"] = {"state": "paused", "since": ev["ts"], "source": actor["kind"], "detail": reason}
+    session["state_version"] = ev["seq"]
+    if runtime is not None:
+        ev = store.append_event(session_id, "runtime.unbound", actor, {"reason": "paused"})
+        session["runtime"] = None
+        session["state_version"] = ev["seq"]
+    store.save_session(session)
+    if runtime is not None:
+        session["runtime"] = runtime
+        session["status"]["state"] = state
+        try:
+            _release_runtime(session, herdr, reason)
+        finally:
+            session["runtime"] = None
+            session["status"]["state"] = "paused"
+    receipt = compute_receipt(store, session)  # a checkpoint: end_state null
+    write_receipt(store, receipt)
+    ev = store.append_event(session_id, "receipt.written", actor,
+                            {"receipt_summary": {"end_state": None, "state_version": receipt["state_version"]}})
+    session["state_version"] = ev["seq"]
+    store.save_session(session)
+    return "paused"
+
+
+def cmd_pause(args, ctx):
+    session = ctx.store.load(args.id_or_name)
+    actor = current_human_actor()
+    require_access(session, actor, "own")
+    reason = args.reason or "paused"
+    if getattr(args, "lane", None):
+        lane = resolve_lane(ctx.store, session, args.lane)
+        if lane["status"]["state"] in TERMINAL_STATES:
+            raise ConflictError(f"lane '{args.lane}' of '{session['name']}' has ended; nothing to pause")
+        _pause_one(lane["id"], ctx.store, ctx.herdr, actor, reason)
+        return EXIT_OK
+    if session["status"]["state"] in TERMINAL_STATES:
+        raise ConflictError(f"session '{session['name']}' has ended ({session['status']['state']}); nothing to pause")
+    # Lanes and other children first, depth-first, each with its own
+    # events and checkpoint receipt (11-agent-lanes.md).
+    def pause_children(s):
+        for child_id in list(s["lineage"]["children"]):
+            child = ctx.store.try_load(child_id)
+            if child is None:
+                continue
+            pause_children(child)
+            _pause_one(child_id, ctx.store, ctx.herdr, actor, reason)
+    pause_children(session)
+    _pause_one(session["id"], ctx.store, ctx.herdr, actor, reason)
+    return EXIT_OK
+
+
+PRUNE_MIN_S = 86400
+
+
+def directory_bytes(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            with contextlib.suppress(OSError):
+                total += os.path.getsize(os.path.join(root, f))
+    return total
+
+
+def prune_candidates(store, sessions, viewer, cutoff=None, only_id=None):
+    """(candidates, skipped): ended sessions the viewer owns, older than
+    `cutoff` (or the one named), with every child ended too. `skipped`
+    names the ones a filter turned away and why, for the dry run."""
+    by_id = {s["id"]: s for s in sessions}
+    candidates, skipped = [], []
+    for s in sessions:
+        if only_id is not None and s["id"] != only_id:
+            continue
+        state = s["status"]["state"]
+        if state not in TERMINAL_STATES:
+            skipped.append((s, "paused" if state == "paused" else ("orphaned" if state == "orphaned" else "live")))
+            continue
+        if access_level_of(s, viewer) != "own":
+            skipped.append((s, "owned by someone else"))
+            continue
+        when = ended_at(s)
+        if cutoff is not None and (when is None or when >= cutoff):
+            continue
+        open_children = [c for c in s["lineage"]["children"] if c in by_id and by_id[c]["status"]["state"] not in TERMINAL_STATES]
+        if open_children:
+            skipped.append((s, f"{len(open_children)} lane{'s' if len(open_children) != 1 else ''} not ended"))
+            continue
+        candidates.append(s)
+    return candidates, skipped
+
+
+def cmd_prune(args, ctx):
+    """The one deletion in the model (01-session-model.md, Retention;
+    02-command-surface.md): a dry run unless --yes, ended sessions only."""
+    viewer = current_human_actor()
+    sessions = ctx.store.list_sessions()
+    if args.session:
+        target = ctx.store.load(args.session)
+        if target["status"]["state"] not in TERMINAL_STATES:
+            raise ConflictError(f"session '{target['name']}' is {target['status']['state']}; prune takes ended sessions only")
+        candidates, skipped = prune_candidates(ctx.store, sessions, viewer, only_id=target["id"])
+        if not candidates:
+            reason = skipped[0][1] if skipped else "no such session"
+            raise ConflictError(f"session '{target['name']}' was not pruned: {reason}")
+    else:
+        seconds = parse_duration(args.older_than)
+        if seconds < PRUNE_MIN_S:
+            raise UsageError("--older-than wants at least 1d; prune never takes today")
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds)
+        candidates, skipped = prune_candidates(ctx.store, sessions, viewer, cutoff=cutoff)
+        skipped = [(s, why) for s, why in skipped if why not in ("live", "orphaned", "paused")]
+    rows = []
+    for s in sorted(candidates, key=lambda s: s["status"]["since"]):
+        when = ended_at(s)
+        rows.append({"id": s["id"], "name": s["name"], "state": s["status"]["state"],
+                     "ended_at": s["status"]["since"],
+                     "ended_local": when.astimezone().strftime("%Y-%m-%d %H:%M") if when else "",
+                     "bytes": directory_bytes(ctx.store.session_dir(s["id"]))})
+    deleted = []
+    if args.yes:
+        for row in rows:
+            shutil.rmtree(ctx.store.session_dir(row["id"]), ignore_errors=False)
+            deleted.append(row["id"])
+    total = sum(r["bytes"] for r in rows)
+    verb = "deleted" if args.yes else "would delete"
+    if args.json:
+        print(json.dumps({"dry_run": not args.yes, "sessions": rows, "total_bytes": total,
+                          "skipped": [{"id": s["id"], "name": s["name"], "why": why} for s, why in skipped]}, indent=2))
+        return EXIT_OK
+    for r in rows:
+        print(f"{verb}  {r['ended_local']}  {r['name']:<28} {r['state']:<8} {r['bytes'] / 1024:6.0f} KB  {r['id']}")
+    for s, why in skipped:
+        print(f"kept          {s['name']:<28} {why}")
+    if not rows:
+        print("nothing to prune" + ("" if args.yes else " (dry run)"))
+    else:
+        print(f"{verb} {len(rows)} session{'s' if len(rows) != 1 else ''}, {total / 1024:.0f} KB"
+              + ("" if args.yes else "; add --yes to delete"))
     return EXIT_OK
 
 
@@ -2771,8 +3400,9 @@ def cmd_rename(args, ctx):
 
 def cmd_assign(args, ctx):
     session = ctx.store.load(args.id_or_name)
-    new_owner = parse_actor_string(args.owner_actor)
+    new_owner = parse_actor_string(args.owner_actor if ":" in args.owner_actor else f"human:{args.owner_actor}")
     actor = current_human_actor()
+    require_access(session, actor, "own")
     old_owner = session["owner"]["actor"]
     ev = ctx.store.append_event(session["id"], "owner.assigned", actor, {"from": old_owner, "to": new_owner})
     session["owner"] = {"actor": new_owner, "assigned_at": ev["ts"], "assigned_by": actor}
@@ -2874,6 +3504,102 @@ def page_text(text):
         subprocess.run(["less", "-R"], input=text + "\n", text=True)
     except FileNotFoundError:
         print(text)
+
+
+def format_span(seconds):
+    """A duration for a person: 17s, 39m, 1h 24m, 2d 3h."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, h, d = s // 60, s // 3600, s // 86400
+    if d > 0:
+        return f"{d}d {h % 24}h"
+    if h > 0:
+        return f"{h}h {m % 60}m"
+    return f"{m}m"
+
+
+def history_days(sessions, days, viewer, include_all):
+    """The ended, non-lane sessions the viewer may see, grouped by the
+    local calendar day they ended, newest day first and newest session
+    first within a day. Returns (groups, ended_in_window, earlier_ended)
+    where groups is a list of (date, [(local_end, session), ...])."""
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    ended = [s for s in sessions if s["status"]["state"] in TERMINAL_STATES and not is_lane(s)]
+    if not include_all:
+        ended = [s for s in ended if can_see(s, viewer)]
+    by_day = {}
+    earlier = 0
+    for s in ended:
+        when = ended_at(s)
+        if when is None:
+            continue
+        if when < cutoff:
+            earlier += 1
+            continue
+        local = when.astimezone()
+        by_day.setdefault(local.date(), []).append((local, s))
+    groups = []
+    for date in sorted(by_day, reverse=True):
+        groups.append((date, sorted(by_day[date], key=lambda t: t[0], reverse=True)))
+    return groups, sum(len(g[1]) for g in groups), earlier
+
+
+def history_state_text(session):
+    """`stopped`, `done · kept`, `failed · harness exited while working`,
+    and `stopped · resumes` when `open` would bring it back."""
+    st = session["status"]
+    text = st["state"]
+    detail = str(st.get("detail") or "").strip()
+    if detail and detail != st["state"]:
+        text += f" · {detail}"
+    if stop_revivable(session):
+        text += " · resumes"
+    return text
+
+
+def render_history_text(groups, days, ended, earlier):
+    lines = [f"History · last {days} day{'s' if days != 1 else ''} · {ended} ended"
+             + (f" · {earlier} earlier" if earlier else "")]
+    if not groups:
+        lines.append("")
+        lines.append(f"Nothing ended in the last {days} day{'s' if days != 1 else ''}."
+                     + (f" {earlier} ended before that: --days {days * 2} reaches further back." if earlier else ""))
+    for date, items in groups:
+        lines.append("")
+        lines.append(f"{date.strftime('%A %Y-%m-%d')} · {len(items)} ended")
+        for local, s in items:
+            try:
+                span = format_span((parse_rfc3339(s["status"]["since"]) - parse_rfc3339(s["created_at"])).total_seconds())
+            except (KeyError, TypeError, ValueError):
+                span = ""
+            project = session_project(s) or ""
+            lines.append(f"  {local.strftime('%H:%M')}  {s['name']:<28} {history_state_text(s):<40} {span:>7}  {s['agent']['kind']:<7} {project}".rstrip())
+    lines.append("")
+    lines.append("receipt <name> shows what a session produced · open <name> resumes a stopped session that says so")
+    return "\n".join(lines)
+
+
+def cmd_history(args, ctx):
+    """Ended sessions by day (02-command-surface.md): the surface for what
+    the panel no longer shows, since the record keeps everything and the
+    panel shows one day (01-session-model.md, Retention; 2026-09-03)."""
+    if args.days < 1:
+        raise UsageError("--days wants a positive integer")
+    viewer = current_human_actor()
+    groups, ended, earlier = history_days(ctx.store.list_sessions(), args.days, viewer, getattr(args, "all", False))
+    if args.json:
+        print(json.dumps({
+            "days": [{"date": date.isoformat(), "sessions": [session_list_entry(s) for _, s in items]} for date, items in groups],
+            "window": {"days": args.days, "ended": ended, "earlier_ended": earlier},
+        }, indent=2))
+        return EXIT_OK
+    text = render_history_text(groups, args.days, ended, earlier)
+    if getattr(args, "pager", False):
+        page_text(text)
+    else:
+        print(text)
+    return EXIT_OK
 
 
 def cmd_capture(args, ctx):
@@ -3072,6 +3798,7 @@ def cmd_mode(args, ctx):
 def cmd_done(args, ctx):
     session = ctx.store.load(args.id_or_name)
     actor = current_human_actor()
+    require_access(session, actor, "own")
     if getattr(args, "lane", None):
         session = resolve_lane(ctx.store, session, args.lane)
     if session["status"]["state"] in TERMINAL_STATES:
@@ -3270,8 +3997,9 @@ def build_sessions_index(store, herdr_state, orphaned, adopted):
         "adopted": list(adopted),
         "counts": {
             "needs_attention": sum(1 for st in states if st in NEEDS_ATTENTION_STATES),
-            "live": sum(1 for st in states if st not in TERMINAL_STATES and st != "orphaned"),
+            "live": sum(1 for st in states if st not in TERMINAL_STATES and st not in ("orphaned", "paused")),
             "orphaned": sum(1 for st in states if st == "orphaned"),
+            "paused": sum(1 for st in states if st == "paused"),
         },
     }
 
@@ -3333,43 +4061,37 @@ def sweep_ended_workspaces(ctx, known, live_agents, live_panes):
     ended or been orphaned. Herdr restores every workspace, with a fresh
     shell, when its server restarts, and `stop` on an orphaned session has
     no pane to close, so by the end of run 2 (2026-09-02) eight dead
-    workspaces sat in Herdr's list. Precise on purpose: only a workspace
-    this launcher bound to the session (the last `runtime.bound` event
-    names it), never one that came from an adopted agent, and only while
-    no live agent runs in it. Returns the session ids whose panes were
-    closed."""
+    workspaces sat in Herdr's list. Precise on purpose: a pane is this
+    session's only when its metadata says so (`tokens.session_id`, which
+    this launcher writes at agent.start), never by workspace id, because
+    Herdr reuses workspace ids after a restart and the id of a session that
+    ended yesterday named a brand-new workspace today, which the sweep
+    closed five seconds after it was created (run 10, 2026-09-03). Never a
+    pane in a workspace with a live agent. Returns the session ids whose
+    panes were closed."""
     agent_workspaces = {a.get("workspace_id") for a in live_agents if a.get("workspace_id")}
-    panes_by_workspace = {}
-    for p in live_panes:
-        wid = p.get("workspace_id")
-        if wid and p.get("pane_id"):
-            panes_by_workspace.setdefault(wid, []).append(p["pane_id"])
-    swept = []
+    ended_ids = {s["id"] for s in known
+                 if (s["status"]["state"] in TERMINAL_STATES or s["status"]["state"] in ("orphaned", "paused"))
+                 and s.get("runtime") is None}
+    adopted = set()
     for s in known:
-        state = s["status"]["state"]
-        if state not in TERMINAL_STATES and state != "orphaned":
+        if s["id"] in ended_ids:
+            events = ctx.store.read_events(s["id"])
+            if any(e["type"] == "session.created" and (e.get("data") or {}).get("adopted") for e in events):
+                adopted.add(s["id"])
+    swept = []
+    for p in live_panes:
+        sid = ((p.get("tokens") or {}).get("session_id"))
+        if not sid or sid not in ended_ids or sid in adopted:
             continue
-        if s.get("runtime") is not None:
+        if p.get("workspace_id") in agent_workspaces or not p.get("pane_id"):
             continue
-        events = ctx.store.read_events(s["id"])
-        if any(e["type"] == "session.created" and (e.get("data") or {}).get("adopted") for e in events):
-            continue
-        # Every workspace this launcher ever bound to the session: a
-        # revived session binds a new one, and Herdr restores the old one
-        # too after a server restart.
-        wids = {(e.get("data") or {}).get("workspace_id") for e in events if e["type"] == "runtime.bound"}
-        closed = False
-        for wid in wids:
-            if not wid or wid in agent_workspaces or wid not in panes_by_workspace:
-                continue
-            for pane_id in panes_by_workspace[wid]:
-                try:
-                    ctx.herdr.pane_close(pane_id=pane_id)
-                    closed = True
-                except (HerdrError, HerdrUnavailable):
-                    pass
-        if closed:
-            swept.append(s["id"])
+        try:
+            ctx.herdr.pane_close(pane_id=p["pane_id"])
+            if sid not in swept:
+                swept.append(sid)
+        except (HerdrError, HerdrUnavailable):
+            pass
     return swept
 
 
@@ -3527,10 +4249,12 @@ def cmd_reconcile(args, ctx):
 COMMAND_HANDLERS = {
     "new": cmd_new, "list": cmd_list, "show": cmd_show, "open": cmd_open,
     "send": cmd_send, "stop": cmd_stop, "rename": cmd_rename, "assign": cmd_assign,
-    "goal": cmd_goal, "log": cmd_log, "receipt": cmd_receipt, "capture": cmd_capture,
+    "goal": cmd_goal, "log": cmd_log, "receipt": cmd_receipt, "history": cmd_history, "capture": cmd_capture,
+    "pause": cmd_pause, "prune": cmd_prune,
     "artifact-add": cmd_artifact_add, "preview": cmd_preview, "mode": cmd_mode,
     "done": cmd_done, "reconcile": cmd_reconcile,
     "add": cmd_add, "lanes": cmd_lanes, "subscribe": cmd_subscribe, "artifact-mark": cmd_artifact_mark,
+    "visibility": cmd_visibility, "grant": cmd_grant, "accept": cmd_accept, "presence": cmd_presence,
 }
 
 

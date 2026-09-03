@@ -6,6 +6,11 @@
 #
 # Bounded by design: output over 64 KB is treated as a failure, not
 # truncated, so Panel.qml's own 64 KB parser cap is never the only seatbelt.
+# The list is asked for through the panel's window, --ended-within 24h
+# (spec/03-sessions-panel.md, 2026-09-03): the store keeps every record,
+# and without the window the payload carried all of them, 53 KB for 52
+# records, one evaluation run short of this cap. The payload's `window`
+# says how many ended earlier, which the panel's footer shows.
 #
 # For local testing, point OMARCHY_SESSION_LIST_CMD at a stand-in command
 # (its value is run through `bash -c`, so it may be a full pipeline):
@@ -25,6 +30,9 @@
 set -o pipefail
 
 MAX_BYTES=65536
+# The panel's window: live and orphaned sessions always, ended ones from
+# the last day. Panel.qml passes its own value as $1 when it has one.
+ENDED_WITHIN=${1:-24h}
 
 run_list() {
   if [[ -n "${OMARCHY_SESSION_LIST_CMD:-}" ]]; then
@@ -33,12 +41,12 @@ run_list() {
   fi
 
   if command -v omarchy-agent-session-core >/dev/null 2>&1; then
-    omarchy-agent-session-core list --json
+    omarchy-agent-session-core list --ended-within "$ENDED_WITHIN" --json
     return $?
   fi
 
   if command -v omarchy-agent-session-list >/dev/null 2>&1; then
-    omarchy-agent-session-list --json
+    omarchy-agent-session-list --ended-within "$ENDED_WITHIN" --json
     return $?
   fi
 

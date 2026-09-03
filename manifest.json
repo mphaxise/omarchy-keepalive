@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.mphaxise.keepalive",
   "name": "Keepalive",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "Praneet Koppula",
   "license": "MIT",
   "description": "Keepalive: coding agents that stay running on the desktop as named omarchy-agent-session records. The bar shows who needs you, who is working, what finished today, and what got orphaned.",

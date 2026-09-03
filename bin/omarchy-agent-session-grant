@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# omarchy:summary=Give another person view, suggest, contribute, or own access to a session (--revoke takes it away)
+# omarchy:args=<id-or-name> --to <user>@<host> [--level view|suggest|contribute|own] [--revoke]
+# omarchy:examples=omarchy agent session grant api-refactor --to sam@mac --level suggest
+
+set -euo pipefail
+
+# Defined in spec/12-two-people.md.
+exec omarchy-agent-session-core grant "$@"
