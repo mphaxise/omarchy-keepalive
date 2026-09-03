@@ -16,7 +16,7 @@ Herdr, Omarchy's agent runtime, keeps the agent process alive. This plugin keeps
 
 **Lanes (0.2.0).** A session can hold more than one agent. Press `a` on a running session, type the task, and a second agent starts in a pane beside the first, on its own git worktree cut from the session's branch. Each lane shows under the session with its state and its task; `w` walks the lanes so Enter, `s`, and `x` act on one of them. A lane that asks a question makes the session need you, with the lane named on the toast and the row. `omarchy-agent-session-done <session> --lane <name> --verdict kept` merges the lane's commits onto the session branch; a conflict shows as a blocked lane and loses nothing. The receipt lists commits per lane. Tested with two Claude Code lanes on one page.
 
-**Twenty-four commands.** All start with `omarchy-agent-session-`. The main ones are `new`, `list`, `open`, `send`, `stop`, `done`, `receipt`, and `show`; `add` and `lanes` are the lane ones. The rest handle names, goals, modes, previews, captures, artifacts, watchers, and who may see or suggest on a session.
+**Twenty-four commands.** All start with `omarchy-agent-session-`. The main ones are `new`, `list`, `open`, `send`, `stop`, `done`, `receipt`, and `show`; `add` and `lanes` are the lane ones. The rest handle names, goals, modes, previews, captures, artifacts, and watchers.
 
 **Notifications.** "api-refactor needs you" when the agent asks a question or a permission. "api-refactor finished" when it is done; click it to see the receipt. "api-refactor stopped unexpectedly" when Herdr loses the process or the machine rebooted; click it to revive.
 
