@@ -1502,6 +1502,7 @@ class TestReconcile(CoreTestCase):
         self.assertEqual(json.loads(out)["ended"], [])
 
     def test_reconcile_adopts_an_unmatched_herdr_agent(self):
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "0"
         self.start_fake_herdr()
         self.fake_herdr.set_result("agent.list", {"agents": [{"name": "orphan-agent", "agent": "claude", "pane_id": "orphan-pane", "workspace_id": "w9", "tab_id": "w9:t1"}]})
         self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "orphan-pane"}]})
@@ -1561,7 +1562,55 @@ class TestReconcile(CoreTestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(len(json.loads(out)["sessions"]), 4)
 
+    def test_reconcile_adopts_an_unknown_agent_only_after_the_grace_period(self):
+        runtime_dir = pathlib.Path(tempfile.mkdtemp(prefix="omarchy-xdg-"))
+        os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "5"
+        try:
+            self.start_fake_herdr()
+            self.fake_herdr.set_result("agent.list", {"agents": [{"name": "stray", "agent": "codex", "pane_id": "p9"}]})
+            self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p9"}]})
+            rc, out, err = self.run_cli(["reconcile", "--json"])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(json.loads(out)["adopted"], [])            # first sighting: wait
+            seen = core.read_unknown_agents()
+            self.assertIn("stray", seen)
+            seen["stray"] = time.time() - 30                            # seen half a minute ago
+            core.write_unknown_agents(seen)
+            rc, out, err = self.run_cli(["reconcile", "--json"])
+            self.assertEqual(len(json.loads(out)["adopted"]), 1)       # still unknown: adopted
+            self.assertEqual(core.read_unknown_agents(), {})
+        finally:
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+            shutil.rmtree(runtime_dir, ignore_errors=True)
+
+    def test_reconcile_never_adopts_an_agent_whose_pane_names_a_session(self):
+        # `new` between agent.start and runtime.bound: the pane already
+        # carries the session id, the record has no runtime yet.
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "0"
+        self.start_fake_herdr()
+        sid = make_bare_session(self.store, "mid-start", runtime=None, state="starting")
+        self.fake_herdr.set_result("agent.list", {"agents": [{"name": "mid-start", "agent": "claude", "pane_id": "wK:p1", "workspace_id": "wK"}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "wK:p1", "workspace_id": "wK", "tokens": {"session_id": sid}}]})
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["adopted"], [])
+        self.assertEqual(len([s for s in self.store.list_sessions() if s["name"].startswith("herdr-")]), 0)
+
+    def test_a_person_at_the_machine_owns_an_adopted_session(self):
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "0"
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [{"name": "stray", "agent": "codex", "pane_id": "p9"}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p9"}]})
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        adopted_id = json.loads(out)["adopted"][0]
+        self.assertEqual(core.access_level_of(self.store.try_load(adopted_id), core.current_human_actor()), "own")
+        rc, out, err = self.run_cli(["stop", adopted_id])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.store.try_load(adopted_id)["status"]["state"], "stopped")
+
     def test_reconcile_index_counts_adopted_sessions_as_live(self):
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "0"
         self.start_fake_herdr()
         self.fake_herdr.set_result("agent.list", {"agents": [{"name": "stray", "agent": "codex", "pane_id": "p9"}]})
         self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p9"}]})

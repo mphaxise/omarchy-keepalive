@@ -2055,6 +2055,11 @@ def access_level_of(session, actor):
     the actor may not see it at all."""
     if same_actor(session.get("created_by"), actor) or same_actor((session.get("owner") or {}).get("actor"), actor):
         return "own"
+    # An adopted session was created and is owned by the system actor, which
+    # nobody can be; it belongs to the people at this machine (run 14
+    # rehearsal, 2026-09-03: `stop` refused the adopted twin to everyone).
+    if ((session.get("owner") or {}).get("actor") or {}).get("kind") == "system" and actor.get("kind") == "human":
+        return "own"
     for grant in session.get("access") or []:
         if same_actor(grant.get("actor"), actor):
             return grant.get("level")
@@ -2148,6 +2153,40 @@ def cmd_accept(args, ctx):
 
 
 PRESENCE_TTL_S = 600
+
+
+ADOPT_GRACE_S = 10
+
+
+def adopt_grace_seconds():
+    with contextlib.suppress(ValueError, TypeError):
+        return float(os.environ.get("OMARCHY_ADOPT_GRACE_S", ADOPT_GRACE_S))
+    return float(ADOPT_GRACE_S)
+
+
+def unknown_agents_path():
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return pathlib.Path(base) / "omarchy-sessions" / "unknown-agents.json"
+
+
+def read_unknown_agents():
+    """agent_id -> the time a reconcile first saw it with no session; lives
+    in the runtime directory with presence, gone with it."""
+    with contextlib.suppress(OSError, ValueError):
+        data = json.loads(unknown_agents_path().read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {k: float(v) for k, v in data.items()}
+    return {}
+
+
+def write_unknown_agents(seen):
+    with contextlib.suppress(OSError):
+        path = unknown_agents_path()
+        if not seen:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(seen), encoding="utf-8")
 
 
 def presence_dir(session_id):
@@ -4210,9 +4249,27 @@ def cmd_reconcile(args, ctx):
     swept = sweep_ended_workspaces(ctx, known, live_agents, live_panes)
 
     known_agent_ids = {(s.get("runtime") or {}).get("agent_id") for s in known if s.get("runtime")}
+    # Adoption waits. `new` starts the harness, stamps the pane with the
+    # session id, then binds the record, and a reconcile that lands in
+    # between saw an unknown agent and adopted it as a twin of the session
+    # it belonged to (rig, run 14 rehearsal, 2026-09-03: `herdr-my-draft`
+    # beside `my-draft`, same pane). So an agent whose pane names one of our
+    # sessions is never adopted, and any other unknown agent is adopted only
+    # once it has been unknown for ADOPT_GRACE_S across reconciles.
+    session_by_pane = {p.get("pane_id"): ((p.get("tokens") or {}).get("session_id")) for p in live_panes if p.get("pane_id")}
+    unknown_seen = read_unknown_agents()
+    now_ts = time.time()
+    still_unknown = {}
     for a in live_agents:
         agent_id = a.get("agent_id")
         if not agent_id or agent_id in known_agent_ids:
+            continue
+        stamped = session_by_pane.get(a.get("pane_id"))
+        if stamped and ctx.store.try_load(stamped) is not None:
+            continue
+        first_seen = unknown_seen.get(agent_id, now_ts)
+        still_unknown[agent_id] = first_seen
+        if now_ts - first_seen < adopt_grace_seconds():
             continue
         session_id = new_ulid()
         name = f"herdr-{a.get('name') or agent_id}"
@@ -4237,6 +4294,8 @@ def cmd_reconcile(args, ctx):
         record["state_version"] = ev["seq"]
         ctx.store.save_session(record)
         adopted.append(session_id)
+        still_unknown.pop(agent_id, None)
+    write_unknown_agents(still_unknown)
 
     write_sessions_index(ctx.store, "running", orphaned, adopted)
     if args.json:
