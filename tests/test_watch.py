@@ -204,6 +204,17 @@ class TestCopyAndClickTargets(WatchTestCase):
         self.assertEqual(sent["exec_argv"], OPEN_S1)
         self.assertEqual(sent["urgency"], "normal")
 
+    def test_a_lane_that_needs_you_names_its_session_and_lane(self):
+        # 11-agent-lanes.md: the toast reads the way the panel row does.
+        watcher = self.make_watcher()
+        write_session(self.tmpdir, "l1", "api-refactor.tests", agent={"kind": "claude"},
+                      lane={"name": "tests", "parent_id": "s1", "parent_name": "api-refactor"},
+                      goal={"text": "Write the tests"})
+        append_event(self.tmpdir, "l1", 1, "status.changed", {"from": "working", "to": "blocked"})
+        watcher.scan_once(now=self.clock())
+        sent = self.notifier.sent[-1]
+        self.assertEqual(sent["headline"], "api-refactor · tests needs you")
+
     def test_blocked_reads_the_same_as_waiting(self):
         # Herdr reports a question and a permission prompt both as `blocked`,
         # so the title must not guess which; the two stay distinct kinds

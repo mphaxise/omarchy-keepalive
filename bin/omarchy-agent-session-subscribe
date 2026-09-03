@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# omarchy:summary=One session watches another: every event leaves one marked notice on the watcher
+# omarchy:args=<watched-id-or-name> --watcher <session> [--remove]
+# omarchy:examples=omarchy agent session subscribe api-tests --watcher api-refactor
+
+set -euo pipefail
+
+# Pattern 06, event-driven state. A parent watches every lane and child it
+# spawns without this command; this is for any other reader.
+exec omarchy-agent-session-core subscribe "$@"

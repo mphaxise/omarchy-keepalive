@@ -27,6 +27,8 @@ CursorSurface {
   property var session: null          // one row object from list --json
   property bool stopArmed: false      // second x / click within this arm executes
   property bool sendOpen: false       // inline send field visible
+  property bool addOpen: false        // inline add-an-agent field visible (11-agent-lanes.md)
+  property string selectedLane: ""    // the lane the cursor is on inside this row; "" is the session's own agent
   property bool stopping: false       // Stop confirmed, record not yet stopped
   property bool emphasized: false     // the first Needs-you row: the eye must land here
   property string busyText: ""        // an action is running for this row ("opening…")
@@ -50,6 +52,10 @@ CursorSurface {
   signal stopConfirmRequested(string id)
   signal hoverRequested(string id)
   signal previewRequested(string id)
+  signal addOpenRequested(string id)
+  signal addSubmitRequested(string id, string text)
+  signal addCancelRequested(string id)
+  signal laneSelectRequested(string id, string lane)
 
   readonly property string sid: session ? String(session.id || "") : ""
   readonly property string sname: session && session.name ? String(session.name) : sid
@@ -68,6 +74,16 @@ CursorSurface {
   readonly property int loopInstructions: session && session.loop ? Number(session.loop.instructions || 0) : 0
   readonly property int loopCaptures: session && session.loop ? Number(session.loop.captures || 0) : 0
   readonly property bool needsAttention: session ? session.needs_attention === true : false
+  // 11-agent-lanes.md: the session's lanes, and the lane that needs you
+  // when the session's own agent does not (folded in by Panel.foldLanes).
+  // A delegate's `session` comes through the model as a QVariantMap, so a
+  // nested array arrives as a QVariantList: it has a length and iterates,
+  // and Array.isArray says false (rig, run 9, 2026-09-03: lane lines never
+  // showed). Test length, never isArray, on anything read from `session`.
+  readonly property var lanes: session && session.lanes && session.lanes.length !== undefined ? session.lanes : []
+  readonly property bool hasLanes: lanes.length > 0
+  readonly property var attentionLane: session && session.attention_lane ? session.attention_lane : null
+  readonly property bool laneNeedsYou: !needsAttention && attentionLane !== null
 
   readonly property bool isLive: state === "starting" || state === "working" || state === "idle"
     || state === "waiting" || state === "blocked"
@@ -109,6 +125,7 @@ CursorSurface {
     if (stopping) return (motionReduced ? "◌" : spinnerFrames[spinnerIndex]) + " stopping…"
     var age = ageText()
     if (state === "blocked" || state === "waiting") return "needs you" + (age !== "" ? " · " + age : "")
+    if (laneNeedsYou) return attentionLane.lane + " needs you"
     if (state === "orphaned") return "orphaned · " + (resumable ? "resumes conversation" : "fresh start")
     if (isEnded && revivable) return state + " · resumes conversation"
     if (state === "starting") return "starting" + (age !== "" ? " · " + age : "")
@@ -119,7 +136,7 @@ CursorSurface {
     if (busyText !== "") return foreground
     if (actionResult) return actionResult.ok ? foreground : urgentColor
     if (stopping) return urgentColor
-    if (state === "blocked" || state === "waiting") return urgentColor
+    if (state === "blocked" || state === "waiting" || laneNeedsYou) return urgentColor
     if (state === "orphaned" || state === "failed") return foreground
     return dim
   }
@@ -127,7 +144,7 @@ CursorSurface {
   // Dot: color and shape together, so the state holds without color.
   // Filled urgent = needs you; ring in foreground = orphaned; ring in
   // urgent = failed; filled rest color = alive or ended quietly.
-  readonly property color dotColor: (state === "blocked" || state === "waiting" || state === "failed")
+  readonly property color dotColor: (state === "blocked" || state === "waiting" || state === "failed" || laneNeedsYou)
     ? urgentColor : (state === "orphaned" ? foreground : restColor)
   readonly property bool dotHollow: state === "orphaned" || state === "failed"
 
@@ -256,7 +273,7 @@ CursorSurface {
     Item {
       width: parent.width
       height: Math.max(detailLabel.implicitHeight, modeLabel.implicitHeight)
-      visible: !row.sendOpen
+      visible: !row.sendOpen && !row.addOpen
 
       Text {
         id: detailLabel
@@ -287,6 +304,84 @@ CursorSurface {
       }
     }
 
+    // ---------- lanes, cursor row only (11-agent-lanes.md) ----------
+    //
+    // One line per added lane: dot, name, kind, state, the task elided.
+    // The lane the cursor is on carries the cursor fill; a click on a lane
+    // line moves the cursor there, so Enter, s, x, and r act on the lane.
+    Column {
+      width: parent.width
+      visible: row.hasCursor && row.hasLanes && !row.sendOpen && !row.addOpen
+      spacing: Style.space(2)
+      topPadding: Style.space(2)
+
+      Repeater {
+        model: row.lanes
+        delegate: Rectangle {
+          required property var modelData
+          readonly property bool isSelected: row.selectedLane === modelData.lane
+          readonly property bool laneUrgent: modelData.needs_attention === true
+          width: parent.width
+          height: laneText.implicitHeight + Style.space(6)
+          radius: Style.cornerRadius / 2
+          color: isSelected ? Qt.rgba(row.accent.r, row.accent.g, row.accent.b, 0.18) : "transparent"
+          border.width: isSelected ? 1 : 0
+          border.color: row.accent
+
+          MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: row.laneSelectRequested(row.sid, modelData.lane) }
+
+          Rectangle {
+            width: 6; height: 6; radius: 3
+            anchors.left: parent.left; anchors.leftMargin: Style.space(20)
+            anchors.verticalCenter: parent.verticalCenter
+            color: laneUrgent ? row.urgentColor : (modelData.state === "failed" ? "transparent" : row.restColor)
+            border.width: modelData.state === "failed" ? 1 : 0
+            border.color: row.urgentColor
+          }
+          Text {
+            id: laneText
+            textFormat: Text.PlainText
+            anchors.left: parent.left; anchors.leftMargin: Style.space(32)
+            anchors.right: parent.right; anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            elide: Text.ElideRight
+            text: modelData.lane + " · " + (modelData.kind || "") + " · "
+              + (laneUrgent ? "needs you" : String(modelData.state || ""))
+              + (modelData.task ? " · " + modelData.task : "")
+            color: laneUrgent ? row.urgentColor : (isSelected ? row.foreground : row.dim)
+            font.family: row.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+    }
+
+    // ---------- inline Add-an-agent field ----------
+    Row {
+      width: parent.width
+      visible: row.addOpen
+      spacing: Style.space(6)
+
+      TextField {
+        id: addField
+        width: parent.width - addButton.width - Style.space(6)
+        placeholderText: "Add an agent: claude <its task>…"
+        focus: row.addOpen
+        foreground: row.foreground
+        accent: row.accent
+        onAccepted: { row.addSubmitRequested(row.sid, text); text = "" }
+        Keys.onEscapePressed: row.addCancelRequested(row.sid)
+      }
+      Button {
+        id: addButton
+        text: "Add"
+        bordered: true
+        foreground: row.foreground
+        fontFamily: row.fontFamily
+        onClicked: { row.addSubmitRequested(row.sid, addField.text); addField.text = "" }
+      }
+    }
+
     // ---------- inline Send field ----------
     Row {
       width: parent.width
@@ -296,8 +391,10 @@ CursorSurface {
       TextField {
         id: sendField
         width: parent.width - sendButton.width - Style.space(6)
-        placeholderText: row.isOrphaned ? "Queue an instruction, delivered on revive…"
-          : (row.hasPreview ? "Feedback on the preview (a capture goes with it)…" : "Send an instruction…")
+        placeholderText: row.selectedLane !== "" ? ("Send to lane " + row.selectedLane + "…")
+          : (row.isOrphaned ? "Queue an instruction, delivered on revive…"
+          : (row.hasPreview ? "Feedback on the preview (a capture goes with it)…"
+          : (row.hasLanes ? "Send to every lane…" : "Send an instruction…")))
         focus: row.sendOpen
         foreground: row.foreground
         accent: row.accent
@@ -318,7 +415,7 @@ CursorSurface {
     Row {
       width: parent.width
       spacing: Style.space(8)
-      visible: row.hasCursor && !row.sendOpen
+      visible: row.hasCursor && !row.sendOpen && !row.addOpen
       topPadding: Style.space(4)
 
       Button {
@@ -348,6 +445,15 @@ CursorSurface {
         fontFamily: row.fontFamily
         fontSize: Style.font.caption
         onClicked: row.sendOpenRequested(row.sid)
+      }
+      Button {
+        visible: row.isLive
+        text: "a Add"
+        bordered: true
+        foreground: row.foreground
+        fontFamily: row.fontFamily
+        fontSize: Style.font.caption
+        onClicked: row.addOpenRequested(row.sid)
       }
       Button {
         visible: row.hasPreview

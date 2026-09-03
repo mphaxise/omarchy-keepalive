@@ -124,6 +124,11 @@ def render_text(kind: str, record: dict, event: dict, lookup_name: Callable[[str
     """
     name = record.get("name") or record.get("id") or "session"
     data = event.get("data") or {}
+    # 11-agent-lanes.md: a lane's toast names the session and the lane, so
+    # "<session> · <lane> needs you" reads the way the panel row does.
+    lane = record.get("lane") or {}
+    if lane.get("name") and lane.get("parent_name"):
+        name = f"{lane['parent_name']} · {lane['name']}"
     if kind in ("waiting", "blocked"):
         return f"{name} needs you"
     if kind == "done":
@@ -140,7 +145,7 @@ def render_text(kind: str, record: dict, event: dict, lookup_name: Callable[[str
         # above is already the parent. Click target and self-suppression both
         # use the parent session id too (see SessionWatcher._handle_event);
         # neither spec file states this explicitly. Flagged in README-shell.md.
-        child_name = lookup_name(child_id) or child_id or "child session"
+        child_name = data.get("lane") or lookup_name(child_id) or child_id or "child session"
         state = data.get("state", "")
         return f"{name}: {child_name} finished ({state})"
     return f"{name}: {kind}"

@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# omarchy:summary=Relabel an artifact proposed or live
+# omarchy:args=<id-or-name> <label|path|id-prefix> --state proposed|live
+# omarchy:examples=omarchy agent session artifact-mark api-refactor iter3-after --state live
+
+set -euo pipefail
+
+# 05-receipts-and-artifacts.md: captures start as proposed; a capture of
+# the shipped thing is marked live by a person.
+exec omarchy-agent-session-core artifact-mark "$@"

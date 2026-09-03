@@ -74,6 +74,10 @@ Panel {
   property string armedStopId: ""
   property string sendOpenId: ""
   property bool newOpen: false      // the New session field under the hero
+  property string addOpenId: ""     // the Add-an-agent field on a row (11-agent-lanes.md)
+  // The lane the cursor is on inside the cursor row: "" is the session's
+  // own agent (main); `l` walks the added lanes. Reset on every cursor move.
+  property string selectedLane: ""
   property bool openNewNext: false  // right click on the icon: open with the field ready
   property bool doneExpanded: false
 
@@ -85,7 +89,7 @@ Panel {
 
   function setCursor(id, fromKeyboard) {
     if (id === "" || id === undefined) return
-    if (id !== root.selectedId) root.armedStopId = ""  // a move disarms (finding 10)
+    if (id !== root.selectedId) { root.armedStopId = ""; root.selectedLane = "" }  // a move disarms (finding 10)
     root.selectedId = String(id)
     root.cursorActive = true
   }
@@ -128,6 +132,8 @@ Panel {
     cursorActive = true
     armedStopId = ""
     sendOpenId = ""
+    addOpenId = ""
+    selectedLane = ""
     newOpen = openNewNext
     openNewNext = false
     nowMs = Date.now()
@@ -194,7 +200,7 @@ Panel {
         // the last nowMs read as a negative age (the hero's "0M", rig e5).
         var previousIndex = root.selectedIndex
         root.nowMs = Date.now()
-        root.snapshot = { sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [] }
+        root.snapshot = { sessions: root.foldLanes(Array.isArray(parsed.sessions) ? parsed.sessions : []) }
         root.clearStoppedFromStopping(root.snapshot.sessions)
         root.reconcileCursor(previousIndex)
         root.recordSuccess()
@@ -296,14 +302,42 @@ Panel {
     return state === "blocked" ? 0 : (state === "waiting" ? 1 : 2)
   }
 
+  // 11-agent-lanes.md: a lane is a child session the list marks with
+  // `lane`; it never gets a row of its own. Its session carries it in
+  // `lanes`, and a lane that needs you makes its session need you: the
+  // session's `attention_lane` names the lane, and `att_state` and
+  // `att_since` are what the Needs-you ranking reads.
+  function foldLanes(sessions) {
+    var out = []
+    for (var i = 0; i < sessions.length; i++) {
+      var s = sessions[i]
+      if (s.lane) continue
+      var lanes = Array.isArray(s.lanes) ? s.lanes : []
+      var att = null
+      for (var j = 0; j < lanes.length; j++) {
+        var l = lanes[j]
+        if (!l.needs_attention) continue
+        if (!att || root.attentionRank(l.state) < root.attentionRank(att.state)
+            || (root.attentionRank(l.state) === root.attentionRank(att.state) && Date.parse(l.since || "") < Date.parse(att.since || ""))) att = l
+      }
+      s.attention_lane = att
+      var own = s.needs_attention === true
+      s.att_state = own ? s.status.state : (att ? att.state : (s.status ? s.status.state : ""))
+      s.att_since = own ? s.status.since : (att ? att.since : (s.status ? s.status.since : ""))
+      s.lane_attention_count = lanes.filter(function(x) { return x.needs_attention }).length
+      out.push(s)
+    }
+    return out
+  }
+
   // 1. Needs you: blocked, waiting; the longest-neglected session leads.
   function needsYouSessions() {
     var list = root.allSessions.filter(function(s) {
-      return s.status && (s.status.state === "blocked" || s.status.state === "waiting")
+      return s.status && (s.att_state === "blocked" || s.att_state === "waiting")
     })
     list.sort(function(a, b) {
-      var r = root.attentionRank(a.status.state) - root.attentionRank(b.status.state)
-      return r !== 0 ? r : root.sinceMs(a) - root.sinceMs(b)
+      var r = root.attentionRank(a.att_state) - root.attentionRank(b.att_state)
+      return r !== 0 ? r : Date.parse(a.att_since || "") - Date.parse(b.att_since || "")
     })
     return list
   }
@@ -319,7 +353,7 @@ Panel {
   // 3. Working: starting, working, idle. Most recently changed first.
   function workingSessions() {
     var states = { starting: true, working: true, idle: true }
-    var list = root.allSessions.filter(function(s) { return s.status && states[s.status.state] })
+    var list = root.allSessions.filter(function(s) { return s.status && states[s.status.state] && !s.attention_lane })
     list.sort(function(a, b) { return root.sinceMs(b) - root.sinceMs(a) })
     return list
   }
@@ -346,7 +380,10 @@ Panel {
   // it is what gets trimmed.
   readonly property var visibleRows: needsYouRows.concat(orphanedRows).concat(workingRows).concat(doneShownRows).slice(0, root.maxRows)
 
-  readonly property int needsAttentionCount: allSessions.filter(function(s) { return s.needs_attention === true }).length
+  // The badge counts every agent that is asking: sessions and their lanes.
+  readonly property int needsAttentionCount: allSessions.reduce(function(n, s) {
+    return n + (s.needs_attention === true ? 1 : 0) + (s.lane_attention_count || 0)
+  }, 0)
   readonly property int workingCount: allSessions.filter(function(s) { return s.status && (s.status.state === "working" || s.status.state === "starting") }).length
   readonly property int idleCount: allSessions.filter(function(s) { return s.status && s.status.state === "idle" }).length
 
@@ -381,7 +418,8 @@ Panel {
       base = "list unavailable"
     } else if (root.needsYouRows.length > 0) {
       var first = root.needsYouRows[0]
-      base = "needs you · " + root.formatDuration(root.nowMs - root.sinceMs(first)) + " · Enter opens"
+      var who = first.needs_attention !== true && first.attention_lane ? ("lane " + first.attention_lane.lane + " needs you · ") : "needs you · "
+      base = who + root.formatDuration(root.nowMs - Date.parse(first.att_since || "")) + " · Enter opens"
       if (root.needsYouRows.length > 1) base += " · " + (root.needsYouRows.length - 1) + " more need you"
     } else if (root.orphanedRows.length > 0) {
       base = root.herdrDown ? "Herdr is not running · Enter revives" : "Enter revives"
@@ -477,6 +515,9 @@ Panel {
     } else if (kind === "preview") {
       if (code === 0) { root.close(); return }
       root.setResult(sid, "no preview to show · " + root.reason(code), false)
+    } else if (kind === "add") {
+      if (code === 0) { root.addOpenId = ""; root.setResult(sid, "agent added", true) }
+      else root.setResult(sid, "couldn't add · " + root.reason(code), false)
     } else if (kind === "new") {
       // The session's terminal is open by now (new-session.sh runs `open`);
       // the panel gets out of its way and the row appears on the next poll.
@@ -507,16 +548,52 @@ Panel {
     return null
   }
 
-  function openSession(id) {
+  function openSession(id, lane) {
     if (!id) return
     var s = root.sessionById(id)
-    root.runAction(id, "open", ["omarchy-agent-session-open", String(id)], root.sessionRevivable(s) ? "reviving…" : "opening…")
+    var argv = ["omarchy-agent-session-open", String(id)]
+    if (lane) argv.push("--lane", String(lane))
+    root.runAction(id, "open", argv, root.sessionRevivable(s) ? "reviving…" : "opening…")
   }
 
-  function sendToSession(id, text) {
+  // The cursor's lane, or the lane that needs you when the cursor is on
+  // the session itself and only a lane is asking: Enter should answer it.
+  function laneForAction(s) {
+    if (root.selectedLane !== "") return root.selectedLane
+    if (s && s.needs_attention !== true && s.attention_lane) return s.attention_lane.lane
+    return ""
+  }
+
+  function laneEntry(s, lane) {
+    if (!s || !lane || !Array.isArray(s.lanes)) return null
+    for (var i = 0; i < s.lanes.length; i++) if (s.lanes[i].lane === lane) return s.lanes[i]
+    return null
+  }
+
+  function walkLane(s) {
+    var lanes = s && Array.isArray(s.lanes) ? s.lanes : []
+    if (lanes.length === 0) { root.selectedLane = ""; return }
+    if (root.selectedLane === "") { root.selectedLane = lanes[0].lane; return }
+    for (var i = 0; i < lanes.length; i++) {
+      if (lanes[i].lane === root.selectedLane) { root.selectedLane = i + 1 < lanes.length ? lanes[i + 1].lane : ""; return }
+    }
+    root.selectedLane = ""
+  }
+
+  // Add an agent to a live session (11-agent-lanes.md): the field's text
+  // is "<kind> <task>" when the first word names a harness, else the
+  // default agent and the whole text as the task.
+  function addAgent(id, text) {
+    var t = String(text || "").trim()
+    if (!id || t === "") return
+    root.runAction(id, "add", [scriptPath("add-agent.sh"), String(id), t], "adding an agent…")
+  }
+
+  function sendToSession(id, text, lane) {
     if (!id || String(text || "").trim() === "") return
     var s = root.sessionById(id)
     var argv = ["omarchy-agent-session-send", String(id), String(text)]
+    if (lane) argv.push("--lane", String(lane))
     // 09-closed-loop-surfaces.md section 3: feedback typed while looking
     // at the preview travels with a capture of it. The capture has to show
     // the preview and not this panel over it, so the panel closes first
@@ -558,10 +635,12 @@ Panel {
     root.runAction(id, "preview", ["omarchy-agent-session-preview", String(id), "--focus"], "")
   }
 
-  function stopSession(id) {
+  function stopSession(id, lane) {
     if (!id) return
-    var next = Object.assign({}, root.stoppingIds); next[String(id)] = Date.now(); root.stoppingIds = next
-    root.runAction(id, "stop", ["omarchy-agent-session-stop", String(id)], "")
+    var argv = ["omarchy-agent-session-stop", String(id)]
+    if (lane) argv.push("--lane", String(lane))
+    else { var next = Object.assign({}, root.stoppingIds); next[String(id)] = Date.now(); root.stoppingIds = next }
+    root.runAction(id, "stop", argv, lane ? "stopping lane…" : "")
   }
 
   function clearStoppedFromStopping(sessions) {
@@ -685,11 +764,15 @@ Panel {
     // Fits 400 px at the default font; `r` (receipt) works on every row
     // and the ended rows' own button says so, so it stays off the legend.
     if (root.newOpen) return "⏎ starts it in " + root.newSessionDir + " · esc cancels"
+    if (root.addOpenId !== "") return "⏎ adds the agent · esc cancels"
     // Priority order, six entries at most: that is what fits 400 px at the
     // default font (run 4, 2026-09-03). "→ more" also sits on the Done
     // today header, and esc closes every panel, so they give way first.
     var parts = ["↑↓ move", "⏎ open", "s send", "x stop", "n new"]
     var cur = root.selectedSession
+    var curLive = cur && cur.status && !root.sessionEnded(cur) && cur.status.state !== "orphaned"
+    if (cur && Array.isArray(cur.lanes) && cur.lanes.length > 0) parts.push("w lane")
+    else if (curLive) parts.push("a add")
     if (cur && cur.preview && cur.preview.value) parts.push("p preview")
     if (root.doneHiddenCount > 0) parts.push("→ more")
     else if (root.doneExpanded) parts.push("← fewer")
@@ -727,7 +810,7 @@ Panel {
       anchors.fill: parent
 
       onMoveRequested: function(dx, dy) {
-        if (root.sendOpenId !== "" || root.newOpen) return   // a field owns its keys
+        if (root.sendOpenId !== "" || root.newOpen || root.addOpenId !== "") return   // a field owns its keys
         if (dx !== 0) {
           if (dx > 0 && root.doneHiddenCount > 0) root.doneExpanded = true
           else if (dx < 0 && root.doneExpanded) root.doneExpanded = false
@@ -736,50 +819,69 @@ Panel {
         if (dy !== 0) root.moveCursor(dy)
       }
       onActivateRequested: {
-        if (root.sendOpenId !== "" || root.newOpen) return
+        if (root.sendOpenId !== "" || root.newOpen || root.addOpenId !== "") return
         var s = root.selectedSession
         if (!s) return
+        var lane = root.laneForAction(s)
+        if (lane) {
+          var le = root.laneEntry(s, lane)
+          var laneEnded = le && (le.state === "done" || le.state === "failed" || le.state === "stopped")
+          if (laneEnded) root.openReceipt(le.id); else root.openSession(s.id, lane)
+          return
+        }
         if (root.sessionEnded(s) && !root.sessionRevivable(s)) root.openReceipt(s.id); else root.openSession(s.id)
       }
       onDeleteRequested: {
         // PanelKeyCatcher routes `x` here, never to onTextKey.
-        if (root.sendOpenId !== "" || root.newOpen) return
+        if (root.sendOpenId !== "" || root.newOpen || root.addOpenId !== "") return
         var s = root.selectedSession
         if (!s) return
         var ended = s.status && (s.status.state === "done" || s.status.state === "failed" || s.status.state === "stopped")
-        if (ended) return
-        if (root.armedStopId === s.id) { root.stopSession(s.id); root.armedStopId = "" }
+        if (ended && root.selectedLane === "") return
+        if (root.armedStopId === s.id) { root.stopSession(s.id, root.selectedLane); root.armedStopId = "" }
         else root.armedStopId = s.id
       }
       // Tab and Shift+Tab walk to the neighbouring bar panel, the shell's
       // convention (plugins.omarchy.org/develop.html, the built-in agents
       // plugin); a field that is open keeps the key.
       onTabRequested: function(direction) {
-        if (root.sendOpenId !== "" || root.newOpen) return
+        if (root.sendOpenId !== "" || root.newOpen || root.addOpenId !== "") return
         root.switchPanel(direction)
       }
       onCloseRequested: {
-        // Esc clears an open Send field or an armed Stop first, and closes
-        // the panel on the press after that.
+        // Esc clears an open field or an armed Stop first, then a lane
+        // cursor, and closes the panel on the press after that.
         if (root.newOpen) { root.newOpen = false; return }
         if (root.sendOpenId !== "") { root.sendOpenId = ""; return }
+        if (root.addOpenId !== "") { root.addOpenId = ""; return }
         if (root.armedStopId !== "") { root.armedStopId = ""; return }
+        if (root.selectedLane !== "") { root.selectedLane = ""; return }
         root.close()
       }
       onTextKey: function(t) {
-        if (root.sendOpenId !== "" || root.newOpen) return
+        if (root.sendOpenId !== "" || root.newOpen || root.addOpenId !== "") return
         if (t === "n" || t === "N") { root.openNew(); return }
         var s = root.selectedSession
         if (!s) return
         var ended = s.status && (s.status.state === "done" || s.status.state === "failed" || s.status.state === "stopped")
         if (t === "s" || t === "S") {
-          if (ended) return
+          if (ended && root.selectedLane === "") return
           root.armedStopId = ""
           root.sendOpenId = s.id
         } else if (t === "r" || t === "R") {
-          root.openReceipt(s.id)
+          var le = root.laneEntry(s, root.selectedLane)
+          root.openReceipt(le ? le.id : s.id)
         } else if (t === "p" || t === "P") {
           if (s.preview && s.preview.value) root.focusPreview(s.id)
+        } else if (t === "w" || t === "W") {
+          // 11-agent-lanes.md. `w`, because PanelKeyCatcher takes h, j, k,
+          // and l as arrows before onTextKey sees them (run 9, 2026-09-03).
+          root.walkLane(s)
+        } else if (t === "a" || t === "A") {
+          if (ended || s.status.state === "orphaned") return
+          root.armedStopId = ""
+          root.sendOpenId = ""
+          root.addOpenId = s.id
         }
       }
 
@@ -1053,6 +1155,8 @@ Panel {
                     stopArmed: root.armedStopId === modelData.id
                     stopping: root.stoppingIds[modelData.id] !== undefined
                     sendOpen: root.sendOpenId === modelData.id
+                    addOpen: root.addOpenId === modelData.id
+                    selectedLane: root.selectedId === modelData.id ? root.selectedLane : ""
                     busyText: root.busyById[modelData.id] || ""
                     actionResult: root.resultById[modelData.id] || null
                     motionReduced: root.motionReduced
@@ -1066,14 +1170,18 @@ Panel {
 
                     onHasCursorChanged: if (hasCursor) root.ensureVisible(sessionRow)
                     onHoverRequested: function(id) { root.setCursor(id, false) }
-                    onOpenRequested: function(id) { root.setCursor(id, false); root.openSession(id) }
+                    onOpenRequested: function(id) { root.setCursor(id, false); var s = root.sessionById(id); root.openSession(id, root.laneForAction(s)) }
                     onReceiptRequested: function(id) { root.setCursor(id, false); root.openReceipt(id) }
                     onPreviewRequested: function(id) { root.setCursor(id, false); root.focusPreview(id) }
                     onSendOpenRequested: function(id) { root.setCursor(id, false); root.armedStopId = ""; root.sendOpenId = id }
-                    onSendSubmitRequested: function(id, text) { root.sendToSession(id, text); root.sendOpenId = "" }
+                    onSendSubmitRequested: function(id, text) { root.sendToSession(id, text, root.selectedId === id ? root.selectedLane : ""); root.sendOpenId = "" }
+                    onAddOpenRequested: function(id) { root.setCursor(id, false); root.armedStopId = ""; root.sendOpenId = ""; root.addOpenId = id }
+                    onAddSubmitRequested: function(id, text) { root.addAgent(id, text) }
+                    onAddCancelRequested: function(id) { root.addOpenId = "" }
+                    onLaneSelectRequested: function(id, lane) { root.setCursor(id, false); root.selectedLane = lane }
                     onSendCancelRequested: function(id) { root.sendOpenId = "" }
                     onStopArmRequested: function(id) { root.setCursor(id, false); root.sendOpenId = ""; root.armedStopId = id }
-                    onStopConfirmRequested: function(id) { root.stopSession(id); root.armedStopId = "" }
+                    onStopConfirmRequested: function(id) { root.stopSession(id, root.selectedId === id ? root.selectedLane : ""); root.armedStopId = "" }
                   }
                 }
               }

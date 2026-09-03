@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# omarchy:summary=List a session's lanes: main first, then each added agent
+# omarchy:args=<id-or-name> [--json]
+# omarchy:examples=omarchy agent session lanes api-refactor
+
+set -euo pipefail
+
+# Defined in spec/11-agent-lanes.md.
+exec omarchy-agent-session-core lanes "$@"

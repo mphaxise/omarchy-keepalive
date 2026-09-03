@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# omarchy:summary=Pull another agent into a live session with its own task
+# omarchy:args=<id-or-name> --agent <kind> --task <text> [--lane <name>] [--mode personal|shared|restricted] [--share-worktree]
+# omarchy:examples=omarchy agent session add api-refactor --agent codex --task "Write the tests for the router"
+
+set -euo pipefail
+
+# Defined in spec/11-agent-lanes.md. The lane runs as its own agent in a
+# pane beside the session's, in its own worktree on session/<name>--<lane>,
+# and its task is its goal and first instruction.
+exec omarchy-agent-session-core add "$@"

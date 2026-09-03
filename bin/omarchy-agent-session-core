@@ -85,7 +85,28 @@ EVENT_TYPES = (
     "instruction.dropped", "child.spawned", "child.completed",
     "approval.requested", "approval.resolved", "artifact.added",
     "receipt.written", "session.ended",
+    "lane.added", "lane.merged", "artifact.updated",
 )
+
+# 11-agent-lanes.md: a lane is one agent with one task inside a session,
+# recorded as a child session with spawn_reason "lane". The session's own
+# agent is addressed as the lane named LANE_MAIN. A lane's mode may be
+# stricter than the session's and never looser.
+LANE_MAIN = "main"
+MODE_RANK = {"personal": 0, "shared": 1, "restricted": 2}
+
+# 06-event-driven-state (pattern 06): a session may watch another. Every
+# append to the watched session's log leaves at most one pending, marked
+# instruction on each watcher, coalesced until it is delivered; instruction
+# traffic itself never wakes a watcher, which keeps watching from echoing.
+WATCH_SILENT_TYPES = {"instruction.queued", "instruction.delivered", "instruction.dropped", "receipt.written"}
+# What a watcher is told about. Run 9 (2026-09-03): every runtime.bound and
+# working/idle flip on a lane became a marked instruction to the session's
+# own agent, and each one started a turn there. A watcher hears about the
+# states that need a person or end the work, artifacts, merges, and endings.
+WATCH_MATERIAL_STATES = {"blocked", "waiting", "failed", "done", "stopped", "orphaned"}
+WATCH_MATERIAL_TYPES = {"artifact.added", "lane.merged", "child.completed", "session.ended", "goal.set"}
+EVENTS_WARN_AT = 50000
 
 # The state machine table from 01-session-model.md. ANY is the "any live
 # state" wildcard used by three rows (-> done, -> failed, -> stopped).
@@ -691,6 +712,22 @@ class HerdrClient:
     def pane_close(self, pane_id, **_):
         return self.call("pane.close", {"pane_id": pane_id})
 
+    def pane_split(self, workspace_id=None, target_pane_id=None, cwd=None, direction="right", focus=False, **_):
+        """A new shell pane beside an existing one in the same workspace;
+        a lane's harness starts in it (11-agent-lanes.md). Returns the new
+        pane's ids in the shape agent_start consumes."""
+        params = {"direction": direction, "focus": bool(focus)}
+        if workspace_id:
+            params["workspace_id"] = workspace_id
+        if target_pane_id:
+            params["target_pane_id"] = target_pane_id
+        if cwd:
+            params["cwd"] = cwd
+        created = self.call("pane.split", params) or {}
+        pane = created.get("pane") or created
+        return {"pane_id": pane.get("pane_id"), "workspace_id": pane.get("workspace_id") or workspace_id,
+                "tab_id": pane.get("tab_id")}
+
     def worktree_create(self, repo=None, path=None, branch=None, base=None, focus=False, label=None, **_):
         return self.call("worktree.create", {"cwd": repo, "path": path, "branch": branch, "base": base,
                                              "focus": bool(focus), "label": label or branch})
@@ -1004,6 +1041,13 @@ class SessionStore:
             f.write(json.dumps(event, sort_keys=False) + "\n")
             f.flush()
             os.fsync(f.fileno())
+        if seq == EVENTS_WARN_AT:
+            # 06-event-driven-state: no rotation in slice 2. A session log is
+            # days long at most; one this size is a runaway, and the record
+            # says so once instead of quietly growing.
+            eprint(f"session {session_id}: events.jsonl reached {seq} rows; this session should end")
+        if watch_material(event):
+            notify_watchers(self, session_id, event)
         return event
 
     def read_events(self, session_id, since=None, type_filter=None):
@@ -1152,8 +1196,30 @@ def read_artifacts_index(artifacts_dir):
             "path": str(candidates[0]) if candidates else None,
             "label": data.get("label"), "added_by": data.get("added_by"),
             "added_at": data.get("added_at"),
+            "kind": data.get("kind"), "source": data.get("source"), "state": data.get("state"),
         })
     return entries
+
+
+def mark_artifact(store, session_id, label_or_path, state):
+    """Relabel an artifact `proposed` or `live` in its sidecar
+    (05-receipts-and-artifacts.md); the loop view and the receipt read the
+    sidecar. Returns the sidecar data."""
+    artifacts_dir = store.artifacts_dir(session_id)
+    for sidecar in sorted(artifacts_dir.glob("*.json")):
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        stem = sidecar.stem
+        paths = [str(p) for p in artifacts_dir.glob(stem + ".*") if p.suffix != ".json"]
+        if data.get("label") == label_or_path or label_or_path in paths or stem.startswith(str(label_or_path)):
+            data["state"] = state
+            data["state_changed_at"] = now_rfc3339()
+            atomic_write_json(sidecar, data)
+            data["path"] = paths[0] if paths else None
+            return data
+    raise NotFoundError(f"no artifact '{label_or_path}' on session {session_id}")
 
 
 class CaptureError(SessionError):
@@ -1232,6 +1298,20 @@ def compute_receipt(store, session, end_state=None, end_reason=None, ended_at=No
         {"id": e["data"]["child_id"], "end_state": e["data"]["state"]}
         for e in events if e["type"] == "child.completed"
     ]
+    # 11-agent-lanes.md: a session's receipt lists its lanes with the
+    # commits each one merged; a lane's receipt names its session.
+    lanes = []
+    merged_by_child = {e["data"].get("child_id"): e["data"] for e in events if e["type"] == "lane.merged"}
+    for e in events:
+        if e["type"] != "lane.added":
+            continue
+        d = e["data"]
+        child = store.try_load(d.get("child_id"))
+        cst = (child or {}).get("status") or {}
+        merged = merged_by_child.get(d.get("child_id"))
+        lanes.append({"lane": d.get("lane"), "id": d.get("child_id"), "kind": (d.get("agent") or {}).get("kind"),
+                      "task": d.get("task"), "end_state": cst.get("state"), "detail": cst.get("detail"),
+                      "merged_commits": (merged or {}).get("commits") or [], "range": (merged or {}).get("range")})
 
     return {
         "session_id": session["id"], "name": session["name"], "agent": session["agent"],
@@ -1245,6 +1325,8 @@ def compute_receipt(store, session, end_state=None, end_reason=None, ended_at=No
         "instructions": {"delivered": len(delivered), "dropped": len(dropped), "authors": authors},
         "approvals": {"requested": len(approvals_req), "approved": approved, "denied": denied},
         "children": children,
+        "lanes": lanes,
+        "lane": session.get("lane"),
         "harness_session_ref": session["agent"].get("harness_session_ref"),
         "state_version": session["state_version"],
     }
@@ -1289,7 +1371,9 @@ def render_receipt_text(receipt):
     artifacts = receipt.get("artifacts") or []
     lines.append(f"Artifacts  {len(artifacts)}")
     for a in artifacts:
-        lines.append(f"  {pathlib.Path(a['path']).name if a['path'] else '(missing)'}   {a['label']}   {a['added_at']}   {actor_to_string(a['added_by']) if isinstance(a['added_by'], dict) else a['added_by']}")
+        name = a.get("source") if a.get("kind") == "url" else (pathlib.Path(a["path"]).name if a.get("path") else "(missing)")
+        state = f"   {a['state']}" if a.get("state") else ""
+        lines.append(f"  {name}   {a['label']}{state}   {a['added_at']}   {actor_to_string(a['added_by']) if isinstance(a['added_by'], dict) else a['added_by']}")
     lines.append("")
     instr = receipt["instructions"]
     lines.append(f"Instructions  {instr['delivered']} delivered, {instr['dropped']} dropped, {len(instr['authors'])} author(s) ({', '.join(instr['authors'])})")
@@ -1297,6 +1381,16 @@ def render_receipt_text(receipt):
     lines.append(f"Approvals     {appr['requested']} requested, {appr['approved']} approved, {appr['denied']} denied")
     children = receipt.get("children") or []
     lines.append(f"Children      {'none' if not children else ', '.join(c['id'] + ':' + c['end_state'] for c in children)}")
+    lane = receipt.get("lane")
+    if lane:
+        lines.append(f"Lane          {lane.get('name')} of session {lane.get('parent_name') or lane.get('parent_id')}")
+    lanes = receipt.get("lanes") or []
+    if lanes:
+        lines.append("")
+        lines.append("Lanes")
+        for l in lanes:
+            merged = f"{len(l['merged_commits'])} commit(s) merged ({l['range']})" if l.get("merged_commits") else "nothing merged"
+            lines.append(f"  {l['lane']:<12} {l.get('kind') or '?':<9} {l.get('end_state') or '?':<9} {merged}   {l.get('task') or ''}")
     lines.append("")
     lines.append(f"Receipt    state_version {receipt['state_version']}")
     return "\n".join(lines)
@@ -1402,9 +1496,10 @@ def default_session_name(kind, cwd=None, prompt=None, existing_names=()):
 
 
 def new_session_record(session_id, name, created_by, owner, mode, agent_kind, workspace,
-                        cwd, command, goal_text=None, parent_id=None, spawn_reason=None):
+                        cwd, command, goal_text=None, parent_id=None, spawn_reason=None, lane=None):
     now = now_rfc3339()
     return {
+        "lane": lane,
         "id": session_id, "name": name, "created_at": now, "created_by": created_by,
         "owner": {"actor": owner, "assigned_at": now, "assigned_by": created_by},
         "participants": [{"actor": created_by, "first_input_at": now, "last_input_at": now}],
@@ -1471,10 +1566,36 @@ def build_parser():
 
     p = sub.add_parser("open")
     add_id_arg(p)
+    p.add_argument("--lane", help="attach one lane's pane (11-agent-lanes.md)")
+
+    p = sub.add_parser("add", help="pull another agent into a live session with its own task")
+    add_id_arg(p)
+    p.add_argument("--agent", required=True)
+    p.add_argument("--task", help="the lane's goal and its first instruction")
+    p.add_argument("--lane", help="lane name (default: the agent kind)")
+    p.add_argument("--mode", choices=["personal", "shared", "restricted"], help="stricter than the session's, never looser")
+    p.add_argument("--share-worktree", action="store_true", help="work in the session's own worktree instead of a lane worktree")
+    p.add_argument("--direction", default="right", choices=["right", "down"], help="where the lane's pane splits from the session's")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("artifact-mark", help="relabel an artifact proposed or live (05-receipts-and-artifacts.md)")
+    add_id_arg(p)
+    p.add_argument("artifact", help="label, path, or id prefix")
+    p.add_argument("--state", required=True, choices=["proposed", "live"])
+
+    p = sub.add_parser("subscribe", help="one session watches another: every event leaves one marked notice on the watcher (pattern 06)")
+    add_id_arg(p)
+    p.add_argument("--watcher", required=True, help="the session that will be told")
+    p.add_argument("--remove", action="store_true")
+
+    p = sub.add_parser("lanes", help="the session's lanes: main first, then each added agent")
+    add_id_arg(p)
+    p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("send")
     add_id_arg(p)
     p.add_argument("text")
+    p.add_argument("--lane", help="one lane; without it a session with lanes fans out to every live lane")
     p.add_argument("--from", dest="from_session")
     p.add_argument("--about", dest="about_artifact")
     p.add_argument("--with-capture", action="store_true",
@@ -1486,6 +1607,8 @@ def build_parser():
     p = sub.add_parser("stop")
     add_id_arg(p)
     p.add_argument("--keep-children", action="store_true")
+    p.add_argument("--keep-lanes", action="store_true", help="stop the session's own agent and leave its lanes running")
+    p.add_argument("--lane", help="stop one lane only")
     p.add_argument("--reason")
 
     p = sub.add_parser("rename")
@@ -1544,6 +1667,7 @@ def build_parser():
     add_id_arg(p)
     p.add_argument("--verdict", required=True, choices=["kept", "reverted", "needs-person"])
     p.add_argument("--note", required=True)
+    p.add_argument("--lane", help="end one lane: kept merges its branch into the session's, the others leave it")
 
     p = sub.add_parser("reconcile")
     p.add_argument("--json", action="store_true")
@@ -1609,7 +1733,25 @@ def session_list_entry(s):
         # the loop count ("<n> instructions, <m> captures").
         "preview": s.get("preview"),
         "loop": loop_counts(s),
+        # 11-agent-lanes.md: a lane child names its lane and session; a
+        # session lists its lanes (filled in by cmd_list from the loaded set).
+        "lane": ({"name": s["lane"]["name"], "parent_id": s["lane"]["parent_id"], "parent_name": s["lane"].get("parent_name")}
+                 if is_lane(s) else None),
+        "lanes": [],
     }
+
+
+def attach_lane_entries(entries, sessions):
+    """Fill each session entry's `lanes` from the loaded set, main first."""
+    by_id = {s["id"]: s for s in sessions}
+    for e in entries:
+        s = by_id.get(e["id"])
+        if s is None or is_lane(s):
+            continue
+        lanes = [by_id[c] for c in s["lineage"]["children"] if c in by_id and is_lane(by_id[c])]
+        if lanes:
+            e["lanes"] = [lane_summary(c) for c in lanes]
+    return entries
 
 
 def loop_counts(s):
@@ -1687,6 +1829,7 @@ def cmd_new(args, ctx):
                                       {"child_id": session_id, "agent": {"kind": kind}, "spawn_reason": "agent_spawn"})
         parent["state_version"] = pev["seq"]
         ctx.store.save_session(parent)
+        add_watcher(ctx.store, record, parent["id"])  # pattern 06: a parent watches what it spawned
 
     # Start the harness through Herdr. A session record now exists whether
     # or not this succeeds (invariant 1); on HerdrUnavailable the session is
@@ -1745,6 +1888,405 @@ def cmd_new(args, ctx):
     return EXIT_OK
 
 
+# --------------------------------------------------------------------------
+# Watchers (06-event-driven-state, pattern 06)
+# --------------------------------------------------------------------------
+
+def watch_material(event):
+    t = event.get("type")
+    if t in WATCH_SILENT_TYPES:
+        return False
+    if t == "status.changed":
+        return (event.get("data") or {}).get("to") in WATCH_MATERIAL_STATES
+    return t in WATCH_MATERIAL_TYPES
+
+
+def add_watcher(store, watched, watcher_id):
+    """`watcher_id` follows `watched` from its current last event on."""
+    watchers = watched.get("watchers") or []
+    if any(w.get("session_id") == watcher_id for w in watchers):
+        return watched
+    watchers.append({"session_id": watcher_id, "cursor": store._last_seq(watched["id"])})
+    watched["watchers"] = watchers
+    store.save_session(watched)
+    return watched
+
+
+def remove_watcher(store, watched, watcher_id):
+    watched["watchers"] = [w for w in (watched.get("watchers") or []) if w.get("session_id") != watcher_id]
+    store.save_session(watched)
+    return watched
+
+
+def _watch_summary(event):
+    t, d = event["type"], event.get("data") or {}
+    if t == "status.changed":
+        return f"{d.get('from')} -> {d.get('to')}" + (f" ({d.get('detail')})" if d.get("detail") else "")
+    if t == "artifact.added":
+        return f"artifact {d.get('label')}"
+    if t == "session.ended":
+        return f"ended {d.get('state')} ({d.get('reason')})"
+    if t == "lane.merged":
+        return f"lane {d.get('lane')} merged {len(d.get('commits') or [])} commit(s)"
+    if t == "child.completed":
+        return f"{d.get('lane') or d.get('child_id')} finished {d.get('state')}"
+    return t
+
+
+def notify_watchers(store, watched_id, event):
+    """Called from append_event. One pending watch instruction per watcher,
+    coalesced: a second event before delivery updates the pending text and
+    its `seq_to`; delivery (reconcile, or the watcher's own open) advances
+    the cursor. Never raises: a watcher that cannot be updated is skipped."""
+    try:
+        watched = store.try_load(watched_id)
+    except Exception:
+        return
+    if not watched:
+        return
+    watchers = watched.get("watchers") or []
+    if not watchers:
+        return
+    for w in watchers:
+        wid = w.get("session_id")
+        watcher = store.try_load(wid) if wid else None
+        if watcher is None or watcher["status"]["state"] in TERMINAL_STATES:
+            continue
+        pending = next((q for q in watcher.get("queue") or [] if q.get("delivery") == "watch" and q.get("origin_session") == watched_id), None)
+        summary = _watch_summary(event)
+        if pending is not None:
+            pending["seq_to"] = event["seq"]
+            pending["count"] = int(pending.get("count") or 1) + 1
+            pending["text"] = f"{summary} ({pending['count']} events since seq {pending['seq_from']})"
+            store.save_session(watcher)
+            continue
+        instr = new_instruction(summary, agent_actor(watched_id, label=watched["name"]),
+                                delivery="watch", origin_session=watched_id)
+        instr["seq_from"] = int(w.get("cursor") or 0)
+        instr["seq_to"] = event["seq"]
+        instr["count"] = 1
+        ev = store.append_event(wid, "instruction.queued", instr["author"], instr)
+        watcher["queue"].append(instr)
+        watcher["state_version"] = ev["seq"]
+        store.save_session(watcher)
+
+
+def deliver_pending(session, ctx, only_delivery=None):
+    """Deliver the session's queued instructions in order through Herdr,
+    advancing watch cursors as watch instructions land. Returns the number
+    delivered. Used by `open` after a bind and by the reconciler for live
+    sessions; a delivery that fails leaves the instruction queued."""
+    runtime = session.get("runtime")
+    if runtime is None or ctx.herdr is None:
+        return 0
+    pending = [q for q in list(session.get("queue") or []) if only_delivery is None or q.get("delivery") == only_delivery]
+    if not pending:
+        return 0
+    alias = derive_herdr_alias(session["name"], session["id"])
+    if not wait_interactive_ready(ctx.herdr, alias, timeout_s=10.0):
+        return 0
+    delivered = 0
+    for instr in pending:
+        origin = instr.get("origin_session")
+        text = instr["text"]
+        if origin:
+            origin_rec = ctx.store.try_load(origin)
+            text = format_marked_instruction(origin, origin_rec["name"] if origin_rec else origin, instr["text"])
+        try:
+            ctx.herdr.agent_prompt(alias=alias, text=text, wait=False)
+        except (HerdrError, HerdrUnavailable):
+            break
+        ev = ctx.store.append_event(session["id"], "instruction.delivered", instr["author"],
+                                     {"instruction_id": instr["id"], "delivery": instr.get("delivery") or "steer"})
+        session["queue"] = [q for q in session["queue"] if q["id"] != instr["id"]]
+        session["state_version"] = ev["seq"]
+        ctx.store.save_session(session)
+        delivered += 1
+        if instr.get("delivery") == "watch" and origin:
+            watched = ctx.store.try_load(origin)
+            if watched is not None:
+                for w in watched.get("watchers") or []:
+                    if w.get("session_id") == session["id"]:
+                        w["cursor"] = int(instr.get("seq_to") or w.get("cursor") or 0)
+                ctx.store.save_session(watched)
+    return delivered
+
+
+def cmd_subscribe(args, ctx):
+    watched = ctx.store.load(args.id_or_name)
+    watcher = ctx.store.load(args.watcher)
+    if watcher["id"] == watched["id"]:
+        raise UsageError("a session cannot watch itself")
+    if args.remove:
+        remove_watcher(ctx.store, watched, watcher["id"])
+        print(f"{watcher['name']} no longer watches {watched['name']}")
+    else:
+        add_watcher(ctx.store, watched, watcher["id"])
+        print(f"{watcher['name']} watches {watched['name']} from seq {ctx.store._last_seq(watched['id'])}")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# Lanes (11-agent-lanes.md): several agents on one goal inside one session
+# --------------------------------------------------------------------------
+
+def is_lane(session):
+    return bool(session.get("lane")) and (session.get("lineage") or {}).get("spawn_reason") == "lane"
+
+
+def lane_children(store, session):
+    """The session's lanes, in the order they were added, as loaded records."""
+    out = []
+    for child_id in (session.get("lineage") or {}).get("children") or []:
+        child = store.try_load(child_id)
+        if child is not None and is_lane(child):
+            out.append(child)
+    return out
+
+
+def live_lane_children(store, session):
+    return [c for c in lane_children(store, session)
+            if c["status"]["state"] not in TERMINAL_STATES and c["status"]["state"] != "orphaned"]
+
+
+def lane_name_taken(store, session, lane_name):
+    if lane_name == LANE_MAIN:
+        return True
+    return any(c["lane"]["name"] == lane_name for c in lane_children(store, session))
+
+
+def default_lane_name(store, session, kind):
+    base = git_safe_ref(kind) or "lane"
+    if not lane_name_taken(store, session, base):
+        return base
+    n = 2
+    while lane_name_taken(store, session, f"{base}-{n}"):
+        n += 1
+    return f"{base}-{n}"
+
+
+def resolve_lane(store, session, lane_name):
+    """A lane name to its record; `main` (or None) is the session itself."""
+    if lane_name in (None, "", LANE_MAIN):
+        return session
+    for child in lane_children(store, session):
+        if child["lane"]["name"] == lane_name:
+            return child
+    raise NotFoundError(f"session '{session['name']}' has no lane '{lane_name}'")
+
+
+def lane_workspace(parent, lane_name, share):
+    """The lane's own worktree on session/<name>/<lane>, cut from the
+    session's branch, so two agents never edit one tree at once. Sharing
+    the session's worktree is the explicit exception (--share-worktree),
+    and the only choice when the session has no branch of its own."""
+    ws = parent.get("workspace") or {}
+    if share or not ws.get("branch") or not ws.get("repo_root"):
+        return {"repo_root": ws.get("repo_root"), "worktree_path": ws.get("worktree_path"),
+                "branch": ws.get("branch"), "base_branch": ws.get("base_branch"),
+                "created_by_session": False, "shared_with_session": True}
+    repo_root = ws["repo_root"]
+    # Git refs cannot nest under an existing branch name (session/x and
+    # session/x/lane cannot both exist), so the lane branch sits beside the
+    # session branch: session/<name>--<lane>.
+    branch = f"{ws['branch']}--{git_safe_ref(lane_name)}"
+    dest = herdr_worktrees_directory() / f"{git_safe_ref(parent['name'])}--{git_safe_ref(lane_name)}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Plain git here on purpose: Herdr's worktree.create opens a workspace
+    # per worktree, and a lane lives as a pane inside the session's one
+    # workspace (11-agent-lanes.md).
+    run_git(["worktree", "add", str(dest), "-b", branch, ws["branch"]], cwd=repo_root)
+    return {"repo_root": repo_root, "worktree_path": str(dest), "branch": branch,
+            "base_branch": ws["branch"], "created_by_session": True, "shared_with_session": False}
+
+
+def lane_summary(child):
+    st = child["status"]
+    return {
+        "lane": child["lane"]["name"], "id": child["id"], "kind": child["agent"]["kind"],
+        "state": st["state"], "since": st["since"], "detail": st.get("detail"),
+        "task": goal_first_line(child.get("goal")),
+        "mode": child.get("mode"), "branch": (child.get("workspace") or {}).get("branch"),
+        "worktree": (child.get("workspace") or {}).get("worktree_path"),
+        "needs_attention": st["state"] in NEEDS_ATTENTION_STATES,
+        "resumable": bool(child["agent"].get("harness_session_ref")),
+    }
+
+
+def cmd_add(args, ctx):
+    """Pull another agent into a live session with its own task."""
+    parent = ctx.store.load(args.id_or_name)
+    if is_lane(parent):
+        raise ConflictError(f"'{parent['name']}' is a lane; add lanes to its session instead")
+    pstate = parent["status"]["state"]
+    if pstate in TERMINAL_STATES:
+        raise ConflictError(f"session '{parent['name']}' has ended ({pstate}); start a new one")
+    if parent.get("runtime") is None:
+        raise ConflictError(f"session '{parent['name']}' has no running workspace; open (revive) it first")
+    if compute_depth(ctx.store, parent["id"]) + 1 > MAX_LINEAGE_DEPTH:
+        raise ConflictError(f"lineage depth limit ({MAX_LINEAGE_DEPTH}) exceeded")
+    if len(parent["lineage"]["children"]) >= MAX_CHILDREN:
+        raise ConflictError(f"a session holds at most {MAX_CHILDREN} lanes")
+
+    kind = args.agent
+    lane_name = args.lane or default_lane_name(ctx.store, parent, kind)
+    if lane_name == LANE_MAIN or not git_safe_ref(lane_name) or lane_name_taken(ctx.store, parent, lane_name):
+        raise ConflictError(f"lane name '{lane_name}' is taken or reserved in session '{parent['name']}'")
+    mode = args.mode or parent["mode"]
+    if MODE_RANK[mode] < MODE_RANK[parent["mode"]]:
+        raise ConflictError(f"a lane may be stricter than its session, never looser: session is {parent['mode']}, lane asked for {mode}")
+    argv, env, _cell = assemble_launch(kind, mode, [])
+
+    actor = current_human_actor()
+    child_id = new_ulid()
+    name = f"{parent['name']}.{lane_name}"
+    workspace = lane_workspace(parent, lane_name, args.share_worktree)
+    command_str = "omarchy-agent-session-core " + getattr(args, "raw_command", "add")
+    record = new_session_record(
+        child_id, name, actor, actor, mode, kind, workspace, workspace["worktree_path"], command_str,
+        goal_text=args.task, parent_id=parent["id"], spawn_reason="lane",
+        lane={"name": lane_name, "parent_id": parent["id"], "parent_name": parent["name"]},
+    )
+    ctx.store.append_event(child_id, "session.created", actor, {"name": name, "agent": {"kind": kind}, "mode": mode, "lane": lane_name})
+    record["state_version"] = 1
+    ctx.store.save_session(record)
+    if args.task:
+        ev = ctx.store.append_event(child_id, "goal.set", actor, {"text": args.task})
+        record["state_version"] = ev["seq"]
+        ctx.store.save_session(record)
+
+    parent["lineage"]["children"].append(child_id)
+    pev = ctx.store.append_event(parent["id"], "child.spawned", actor,
+                                  {"child_id": child_id, "agent": {"kind": kind}, "spawn_reason": "lane"})
+    add_watcher(ctx.store, record, parent["id"])  # pattern 06: a parent watches what it spawned
+    pev = ctx.store.append_event(parent["id"], "lane.added", actor,
+                                  {"lane": lane_name, "child_id": child_id, "agent": {"kind": kind}, "task": args.task, "mode": mode})
+    parent["state_version"] = pev["seq"]
+    ctx.store.save_session(parent)
+
+    # A pane beside the session's own, in its workspace, then the harness in it.
+    prt = parent["runtime"]
+    alias = derive_herdr_alias(name, child_id)
+    try:
+        pane = ctx.herdr.pane_split(workspace_id=prt.get("workspace_id"), target_pane_id=prt.get("pane_id"),
+                                    cwd=workspace["worktree_path"], direction=args.direction, focus=False)
+        result = ctx.herdr.agent_start(alias=alias, kind=kind, cwd=workspace["worktree_path"], flags=argv, env=env,
+                                       focus=False, session_id=child_id, pane_id=pane.get("pane_id"))
+        result["workspace_id"] = result.get("workspace_id") or pane.get("workspace_id") or prt.get("workspace_id")
+        result["tab_id"] = result.get("tab_id") or pane.get("tab_id") or prt.get("tab_id")
+    except HerdrUnavailable as e:
+        eprint(f"lane {lane_name} created but not started: {e}")
+        raise
+    except HerdrError as e:
+        eprint(f"lane {lane_name} created but Herdr refused: {e}")
+        raise ConflictError(str(e)) from e
+    with contextlib.suppress(HerdrError, HerdrUnavailable):
+        ctx.herdr.call("pane.report_metadata", {"pane_id": result.get("pane_id"), "source": "omarchy-agent-session",
+                                                "title": f"{parent['name']} · {lane_name}",
+                                                "tokens": {"session_id": child_id, "lane": lane_name, "parent_session_id": parent["id"]}})
+
+    runtime = {"backend": "herdr", "session": None, "workspace_id": result.get("workspace_id"),
+               "tab_id": result.get("tab_id"), "pane_id": result.get("pane_id"), "agent_id": result.get("agent_id")}
+    ev = ctx.store.append_event(child_id, "runtime.bound", actor, runtime)
+    record["runtime"] = runtime
+    record["state_version"] = ev["seq"]
+    ev = ctx.store.append_event(child_id, "status.changed", agent_actor(child_id, "herdr"),
+                                 {"from": "starting", "to": "working", "source": "herdr-hook", "detail": None})
+    record["status"] = {"state": "working", "since": ev["ts"], "source": "herdr-hook", "detail": None}
+    record["state_version"] = ev["seq"]
+    ctx.store.save_session(record)
+
+    # The task is the lane's first instruction.
+    if args.task:
+        send_args = argparse.Namespace(id_or_name=child_id, text=args.task, from_session=None, about_artifact=None,
+                                       wait=False, until=[], timeout=None, lane=None, with_capture=False)
+        try:
+            cmd_send(send_args, ctx)
+        except (HerdrUnavailable, HerdrError, ConflictError) as e:
+            eprint(f"lane {lane_name} started; its task stays queued: {e}")
+
+    if args.json:
+        print(json.dumps(record, indent=2))
+    else:
+        print(child_id)
+    return EXIT_OK
+
+
+def cmd_lanes(args, ctx):
+    session = ctx.store.load(args.id_or_name)
+    if is_lane(session):
+        session = ctx.store.load(session["lane"]["parent_id"])
+    rows = [{"lane": LANE_MAIN, "id": session["id"], "kind": session["agent"]["kind"],
+             "state": session["status"]["state"], "since": session["status"]["since"],
+             "detail": session["status"].get("detail"),
+             "task": goal_first_line(session.get("goal")), "mode": session.get("mode"),
+             "branch": (session.get("workspace") or {}).get("branch"),
+             "worktree": (session.get("workspace") or {}).get("worktree_path"),
+             "needs_attention": session["status"]["state"] in NEEDS_ATTENTION_STATES,
+             "resumable": bool(session["agent"].get("harness_session_ref"))}]
+    rows += [lane_summary(c) for c in lane_children(ctx.store, session)]
+    if args.json:
+        print(json.dumps({"session": session["id"], "name": session["name"], "lanes": rows}, indent=2))
+    else:
+        for r in rows:
+            print(f"{r['lane']:<12} {r['kind']:<9} {r['state']:<9} {r['task'] or ''}")
+    return EXIT_OK
+
+
+def merge_lane_into_session(store, parent, child, actor):
+    """`done --lane <name> --verdict kept`: the lane's branch lands on the
+    session's branch, in the session's worktree. A clean merge records
+    lane.merged with the commits; a conflict leaves the merge aborted,
+    the lane blocked with the reason, and nothing lost."""
+    cws, pws = child.get("workspace") or {}, parent.get("workspace") or {}
+    if cws.get("shared_with_session") or not cws.get("branch") or not pws.get("worktree_path"):
+        return {"merged": False, "reason": "shared worktree", "commits": []}
+    parent_wt, parent_branch, lane_branch = pws["worktree_path"], pws.get("branch"), cws["branch"]
+    if not parent_branch or not pathlib.Path(parent_wt).exists():
+        return {"merged": False, "reason": "session worktree missing", "commits": []}
+    before = run_git(["rev-parse", "HEAD"], cwd=parent_wt).stdout.strip()
+    r = run_git(["merge", "--no-edit", lane_branch], cwd=parent_wt, check=False)
+    if r.returncode != 0:
+        run_git(["merge", "--abort"], cwd=parent_wt, check=False)
+        return {"merged": False, "reason": "merge conflict", "commits": [], "output": (r.stderr or r.stdout or "").strip()[-400:]}
+    after = run_git(["rev-parse", "HEAD"], cwd=parent_wt).stdout.strip()
+    log = run_git(["log", "--no-merges", "--format=%H", f"{before}..{after}"], cwd=parent_wt, check=False)
+    commits = [l for l in (log.stdout or "").splitlines() if l]
+    ev = store.append_event(parent["id"], "lane.merged", actor,
+                            {"lane": child["lane"]["name"], "child_id": child["id"], "branch": lane_branch,
+                             "into": parent_branch, "commits": commits, "range": f"{before[:7]}..{after[:7]}"})
+    parent["state_version"] = ev["seq"]
+    store.save_session(parent)
+    return {"merged": True, "reason": None, "commits": commits, "range": f"{before[:7]}..{after[:7]}"}
+
+
+def notify_parent_of_completion(store, herdr, child, end_state, reason):
+    """The completion path every child session has (01-session-model.md):
+    the parent records child.completed and, when its own harness is live,
+    receives a marked instruction so its agent learns the outcome without
+    polling."""
+    parent_id = (child.get("lineage") or {}).get("parent_id")
+    if not parent_id:
+        return
+    parent = store.try_load(parent_id)
+    if parent is None:
+        return
+    actor = agent_actor(child["id"], label=child["name"])
+    lane = (child.get("lane") or {}).get("name")
+    ev = store.append_event(parent_id, "child.completed", actor,
+                            {"child_id": child["id"], "lane": lane, "state": end_state, "reason": reason})
+    parent["state_version"] = ev["seq"]
+    store.save_session(parent)
+    if parent["status"]["state"] in TERMINAL_STATES or parent.get("runtime") is None or herdr is None:
+        return
+    who = f"lane {lane}" if lane else f"child session {child['name']}"
+    text = f"{who} finished: {end_state} ({reason})."
+    send_args = argparse.Namespace(id_or_name=parent_id, text=text, from_session=child["id"], about_artifact=None,
+                                   wait=False, until=[], timeout=None, lane=None, with_capture=False)
+    with contextlib.suppress(Exception):
+        cmd_send(send_args, Context(store, herdr))
+
+
 def cmd_list(args, ctx):
     sessions = ctx.store.list_sessions()
     if args.state:
@@ -1753,13 +2295,15 @@ def cmd_list(args, ctx):
         me = current_human_actor()
         sessions = [s for s in sessions if s["owner"]["actor"].get("id") == me["id"]]
     sessions.sort(key=lambda s: s["created_at"])
+    everything = ctx.store.list_sessions()
+    entries = attach_lane_entries([session_list_entry(s) for s in sessions], everything)
     if args.json:
-        print(json.dumps({"sessions": [session_list_entry(s) for s in sessions]}, indent=2))
+        print(json.dumps({"sessions": entries}, indent=2))
         return EXIT_OK
-    for s in sessions:
-        entry = session_list_entry(s)
+    for entry in entries:
         flag = "!" if entry["needs_attention"] else " "
-        print(f"{flag} {entry['id']}  {entry['name']:<24} {entry['status']['state']:<10} {entry['agent']['kind']}")
+        lane = f"  lane {entry['lane']['name']} of {entry['lane'].get('parent_name') or entry['lane']['parent_id']}" if entry.get("lane") else ""
+        print(f"{flag} {entry['id']}  {entry['name']:<24} {entry['status']['state']:<10} {entry['agent']['kind']}{lane}")
     return EXIT_OK
 
 
@@ -1847,12 +2391,24 @@ def render_loop_text(store, session):
         elif t == "instruction.dropped":
             rows.append((ts, int(e.get("seq") or 0), f"dropped      {d.get('reason')}"))
         elif t == "artifact.added":
-            rows.append((ts, int(e.get("seq") or 0), f"artifact     {d.get('label')}  {d.get('path')}"))
+            what = d.get("path")
+            if d.get("url"):
+                what = d["url"]
+            state = f"  [{d.get('state')}]" if d.get("state") and d.get("state") != "proposed" else ""
+            rows.append((ts, int(e.get("seq") or 0), f"artifact     {d.get('label')}  {what}{state}"))
+        elif t == "artifact.updated":
+            rows.append((ts, int(e.get("seq") or 0), f"artifact     {d.get('label')}  marked {d.get('state')}"))
         elif t == "status.changed":
             detail = f"  ({d.get('detail')})" if d.get("detail") else ""
             rows.append((ts, int(e.get("seq") or 0), f"state        {d.get('from')} -> {d.get('to')}{detail}"))
         elif t == "session.ended":
             rows.append((ts, int(e.get("seq") or 0), f"ended        {d.get('state')}  {d.get('reason')}"))
+        elif t == "lane.added":
+            rows.append((ts, int(e.get("seq") or 0), f"lane         {d.get('lane')} added ({(d.get('agent') or {}).get('kind')}): {(d.get('task') or '').strip().splitlines()[0] if d.get('task') else ''}"))
+        elif t == "lane.merged":
+            rows.append((ts, int(e.get("seq") or 0), f"lane         {d.get('lane')} merged {len(d.get('commits') or [])} commit(s) {d.get('range')} into {d.get('into')}"))
+        elif t == "child.completed":
+            rows.append((ts, int(e.get("seq") or 0), f"lane         {d.get('lane') or d.get('child_id')} ended {d.get('state')} ({d.get('reason')})"))
     ws = session.get("workspace") or {}
     git_cwd = ws.get("worktree_path") if ws.get("worktree_path") and pathlib.Path(ws["worktree_path"]).exists() else ws.get("repo_root")
     if git_cwd and ws.get("base_branch") and ws.get("branch"):
@@ -1905,6 +2461,8 @@ def inferred_exit_revivable(session):
 
 def cmd_open(args, ctx):
     session = ctx.store.load(args.id_or_name)
+    if getattr(args, "lane", None):
+        session = resolve_lane(ctx.store, session, args.lane)
     actor = current_human_actor()
     state = session["status"]["state"]
     runtime = session.get("runtime")
@@ -1956,6 +2514,10 @@ def cmd_open(args, ctx):
                               "herdr", "agent", "attach", alias],
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
+        # Instructions queued while the session had no runtime ("delivered
+        # on revive") and pending watch notices go out now.
+        with contextlib.suppress(Exception):
+            deliver_pending(ctx.store.load(session["id"]), ctx)
         # 09-closed-loop-surfaces.md section 2: the running product sits
         # beside the conversation. Best effort; a missing compositor or
         # browser costs nothing here.
@@ -1999,6 +2561,28 @@ def wait_interactive_ready(herdr, alias, timeout_s=30.0, step_s=0.5):
 
 def cmd_send(args, ctx):
     session = ctx.store.load(args.id_or_name)
+    lane = getattr(args, "lane", None)
+    if lane:
+        return _send_one(resolve_lane(ctx.store, session, lane), args, ctx)
+    lanes = live_lane_children(ctx.store, session) if not is_lane(session) else []
+    if not lanes:
+        return _send_one(session, args, ctx)
+    # A session with lanes and no --lane: the instruction goes to the
+    # session's own agent and every live lane, each as its own record.
+    failures = []
+    targets = ([session] if session.get("runtime") is not None or not lanes else []) + lanes
+    for target in targets:
+        try:
+            _send_one(target, args, ctx)
+        except (ConflictError, HerdrError, HerdrUnavailable) as e:
+            failures.append((target.get("lane") or {}).get("name") or LANE_MAIN)
+            eprint(f"lane {(target.get('lane') or {}).get('name') or LANE_MAIN}: {e}")
+    if failures:
+        raise ConflictError("not delivered to: " + ", ".join(failures))
+    return EXIT_OK
+
+
+def _send_one(session, args, ctx):
     if getattr(args, "with_capture", False) and not args.about_artifact:
         # Situated feedback from the panel: grab the preview as it is right
         # now and tie the instruction to that capture.
@@ -2108,6 +2692,7 @@ def _end_session(session, store, actor, end_state, reason, unbind_reason):
                             {"receipt_summary": {"end_state": end_state, "state_version": receipt["state_version"]}})
     session["state_version"] = ev["seq"]
     store.save_session(session)
+    notify_parent_of_completion(store, None, session, end_state, reason)
 
 
 def _stop_one(session_id, store, herdr, actor, reason):
@@ -2150,13 +2735,18 @@ def _stop_one(session_id, store, herdr, actor, reason):
                             {"receipt_summary": {"end_state": "stopped", "state_version": receipt["state_version"]}})
     session["state_version"] = ev["seq"]
     store.save_session(session)
+    if reason != "parent_stopped":
+        notify_parent_of_completion(store, herdr, session, "stopped", reason)
 
 
 def cmd_stop(args, ctx):
     session = ctx.store.load(args.id_or_name)
     actor = current_human_actor()
     reason = args.reason or "stopped"
-    if not args.keep_children:
+    if getattr(args, "lane", None):
+        _stop_one(resolve_lane(ctx.store, session, args.lane)["id"], ctx.store, ctx.herdr, actor, reason)
+        return EXIT_OK
+    if not (args.keep_children or getattr(args, "keep_lanes", False)):
         for child_id in list(session["lineage"]["children"]):
             _stop_one(child_id, ctx.store, ctx.herdr, actor, "parent_stopped")
     _stop_one(session["id"], ctx.store, ctx.herdr, actor, reason)
@@ -2312,11 +2902,25 @@ def cmd_artifact_add(args, ctx):
     session = ctx.store.load(args.id_or_name)
     actor = current_human_actor()
     entry, _dest = add_artifact(ctx.store, session["id"], args.kind, args.source, args.label, actor)
-    ev = ctx.store.append_event(session["id"], "artifact.added", actor,
-                                 {"path": entry["path"], "label": entry["label"], "added_by": actor})
+    data = {"path": entry["path"], "label": entry["label"], "added_by": actor, "kind": args.kind}
+    if args.kind == "url":
+        data["url"] = args.source   # 09-closed-loop-surfaces.md section 6: a design frame as a link
+    ev = ctx.store.append_event(session["id"], "artifact.added", actor, data)
     session["state_version"] = ev["seq"]
     ctx.store.save_session(session)
     print(entry["path"])
+    return EXIT_OK
+
+
+def cmd_artifact_mark(args, ctx):
+    session = ctx.store.load(args.id_or_name)
+    actor = current_human_actor()
+    data = mark_artifact(ctx.store, session["id"], args.artifact, args.state)
+    ev = ctx.store.append_event(session["id"], "artifact.updated", actor,
+                                 {"label": data.get("label"), "path": data.get("path"), "state": args.state})
+    session["state_version"] = ev["seq"]
+    ctx.store.save_session(session)
+    print(f"{data.get('label')}: {args.state}")
     return EXIT_OK
 
 
@@ -2468,9 +3072,27 @@ def cmd_mode(args, ctx):
 def cmd_done(args, ctx):
     session = ctx.store.load(args.id_or_name)
     actor = current_human_actor()
+    if getattr(args, "lane", None):
+        session = resolve_lane(ctx.store, session, args.lane)
     if session["status"]["state"] in TERMINAL_STATES:
         raise ConflictError(f"session '{session['name']}' already ended ({session['status']['state']})")
-    entry, _dest = add_artifact(ctx.store, session["id"], "note", args.note, "verdict", actor)
+    merge = None
+    if is_lane(session) and args.verdict == "kept":
+        parent = ctx.store.load(session["lane"]["parent_id"])
+        merge = merge_lane_into_session(ctx.store, parent, session, actor)
+        if not merge["merged"] and merge["reason"] == "merge conflict":
+            detail = "merge conflict; open the lane to resolve"
+            old = session["status"]["state"]
+            ev = ctx.store.append_event(session["id"], "status.changed", actor,
+                                         {"from": old, "to": "blocked", "source": "omarchy", "detail": detail})
+            session["status"] = {"state": "blocked", "since": ev["ts"], "source": "omarchy", "detail": detail}
+            session["state_version"] = ev["seq"]
+            ctx.store.save_session(session)
+            raise ConflictError(f"lane '{session['lane']['name']}' did not merge: {merge.get('output') or 'conflict'}")
+    note = args.note
+    if merge is not None and merge["merged"]:
+        note = f"{note}\n\nMerged {len(merge['commits'])} commit(s) ({merge['range']}) into the session branch." if note else f"Merged {len(merge['commits'])} commit(s) ({merge['range']}) into the session branch."
+    entry, _dest = add_artifact(ctx.store, session["id"], "note", note, "verdict", actor)
     ev = ctx.store.append_event(session["id"], "artifact.added", actor,
                                  {"path": entry["path"], "label": "verdict", "added_by": actor})
     session["state_version"] = ev["seq"]
@@ -2510,6 +3132,7 @@ def cmd_done(args, ctx):
                                  {"receipt_summary": {"end_state": "done", "state_version": receipt["state_version"]}})
     session["state_version"] = ev["seq"]
     ctx.store.save_session(session)
+    notify_parent_of_completion(ctx.store, ctx.herdr, session, "done", f"verdict:{args.verdict}")
     return EXIT_OK
 
 
@@ -2798,6 +3421,11 @@ def cmd_reconcile(args, ctx):
             if live is not None:
                 apply_herdr_status(ctx.store, s, live.get("agent_status"))
                 record_harness_session_ref(ctx.store, s, ctx.herdr)
+                # pattern 06: pending watch notices reach a live watcher on
+                # the next tick, between its turns.
+                if any(q.get("delivery") == "watch" for q in s.get("queue") or []) and (live.get("agent_status") in ("idle", "done")):
+                    with contextlib.suppress(Exception):
+                        deliver_pending(ctx.store.load(s["id"]), ctx, only_delivery="watch")
         elif pane_alive and s["status"]["state"] != "starting" and herdr_restarted_since_binding(ctx.store, s):
             # The pane is the fresh shell Herdr opens for every restored
             # workspace when its server restarts; the harness did not exit,
@@ -2902,6 +3530,7 @@ COMMAND_HANDLERS = {
     "goal": cmd_goal, "log": cmd_log, "receipt": cmd_receipt, "capture": cmd_capture,
     "artifact-add": cmd_artifact_add, "preview": cmd_preview, "mode": cmd_mode,
     "done": cmd_done, "reconcile": cmd_reconcile,
+    "add": cmd_add, "lanes": cmd_lanes, "subscribe": cmd_subscribe, "artifact-mark": cmd_artifact_mark,
 }
 
 

@@ -93,8 +93,10 @@ class CoreTestCase(unittest.TestCase):
             self.fake_herdr.stop()
         os.environ.clear()
         os.environ.update(self._old_environ)
-        for d in (self.sessions_dir, self.herdr_dir, self.plain_dir):
-            shutil.rmtree(d, ignore_errors=True)
+        for d in (self.sessions_dir, self.herdr_dir, self.plain_dir, getattr(self, "worktrees_dir", None)):
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+        os.environ.pop("HERDR_WORKTREES_DIR", None)
 
     def start_fake_herdr(self, agent_start_result=None):
         self.fake_herdr = FakeHerdrServer(self.herdr_socket)
@@ -246,7 +248,7 @@ class TestListJsonShape(CoreTestCase):
         self.assertEqual(
             set(entry.keys()),
             {"id", "name", "agent", "status", "owner", "workspace", "needs_attention", "children", "state_version",
-             "goal", "mode", "resumable", "created_by", "project", "preview", "loop"},
+             "goal", "mode", "resumable", "created_by", "project", "preview", "loop", "lane", "lanes"},
         )
         self.assertEqual(set(entry["agent"].keys()), {"kind"})
         self.assertEqual(set(entry["status"].keys()), {"state", "since", "source", "detail"})
@@ -1536,3 +1538,378 @@ class TestCliIsExecutable(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------
+# 11-agent-lanes.md: several agents on one goal inside one session
+# --------------------------------------------------------------------------
+
+class TestLanes(TestReceiptComputation):
+    """A lane is a child session with spawn_reason "lane", its own pane in
+    the session's Herdr workspace, its own worktree cut from the session's
+    branch, and a task that is its goal and first instruction."""
+
+    def start_lane_herdr(self):
+        self.start_fake_herdr()
+        # Worktrees land in a temp dir, and the fake Herdr's worktree.create
+        # does what the real one does on disk: a git worktree on a new
+        # branch, opened as a workspace with a root pane.
+        self.worktrees_dir = pathlib.Path(tempfile.mkdtemp(prefix="omarchy-worktrees-"))
+        os.environ["HERDR_WORKTREES_DIR"] = str(self.worktrees_dir)
+        def fake_worktree_create(params):
+            subprocess.run(["git", "-C", params["cwd"], "worktree", "add", params["path"], "-b", params["branch"], params["base"]],
+                           check=True, capture_output=True, text=True)
+            return {"root_pane": {"pane_id": "p1", "workspace_id": "w1", "tab_id": "t1"}, "workspace": {"workspace_id": "w1"}}
+        self.fake_herdr.set_result("worktree.create", fake_worktree_create)
+        self.fake_herdr.set_result("pane.split", lambda params: {
+            "pane": {"pane_id": "p2", "workspace_id": params.get("workspace_id", "w1"), "tab_id": "t1"}})
+        self.fake_herdr.set_result("agent.list", lambda params: {"agents": [
+            {"name": "any", "agent_status": "idle", "interactive_ready": True}]})
+        self.fake_herdr.set_result("agent.prompt", {"agent": {"agent_status": "working"}})
+        self.fake_herdr.set_result("agent.wait", {"agent": {"agent_status": "idle"}})
+
+    def make_repo_session(self, name="team"):
+        repo = self.make_git_repo_with_two_commits()
+        self._git(repo, "checkout", "main")
+        rc, out, err = self.run_cli(["new", "--agent", "claude", "--mode", "personal", "--name", name,
+                                     "--cwd", str(repo), "--goal", "one page, two agents"])
+        self.assertEqual(rc, 0, err)
+        return repo, out.strip()
+
+    def test_add_creates_a_lane_in_the_sessions_workspace_with_its_own_worktree(self):
+        self.start_lane_herdr()
+        repo, sid = self.make_repo_session()
+        try:
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--task", "Write the tests for the page"])
+            self.assertEqual(rc, 0, err)
+            lane_id = out.strip()
+            lane = self.store.try_load(lane_id)
+            parent = self.store.try_load(sid)
+            self.assertEqual(lane["lane"], {"name": "claude", "parent_id": sid, "parent_name": "team"})
+            self.assertEqual(lane["lineage"]["parent_id"], sid)
+            self.assertEqual(lane["lineage"]["spawn_reason"], "lane")
+            self.assertIn(lane_id, parent["lineage"]["children"])
+            self.assertEqual(lane["name"], "team.claude")
+            self.assertEqual(lane["goal"]["text"], "Write the tests for the page")
+            # Its own worktree, on a branch under the session's branch.
+            self.assertEqual(lane["workspace"]["branch"], "session/team--claude")
+            self.assertEqual(lane["workspace"]["base_branch"], "session/team")
+            self.assertTrue(pathlib.Path(lane["workspace"]["worktree_path"]).exists())
+            self.assertNotEqual(lane["workspace"]["worktree_path"], parent["workspace"]["worktree_path"])
+            # A pane split beside the session's pane, in its workspace, then the harness in it.
+            split = self.fake_herdr.calls("pane.split")[-1]
+            self.assertEqual(split["workspace_id"], parent["runtime"]["workspace_id"])
+            self.assertEqual(split["target_pane_id"], parent["runtime"]["pane_id"])
+            self.assertEqual(split["cwd"], lane["workspace"]["worktree_path"])
+            self.assertEqual(self.fake_herdr.calls("agent.start")[-1]["pane_id"], "p2")
+            self.assertEqual(lane["runtime"]["pane_id"], "p2")
+            self.assertEqual(lane["runtime"]["workspace_id"], parent["runtime"]["workspace_id"])
+            # The task reached the lane as its first instruction.
+            types = [e["type"] for e in self.store.read_events(lane_id)]
+            self.assertIn("instruction.delivered", types)
+            ptypes = [e["type"] for e in self.store.read_events(sid)]
+            self.assertIn("lane.added", ptypes)
+            self.assertIn("child.spawned", ptypes)
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_lane_names_default_to_the_kind_and_stay_unique(self):
+        self.start_lane_herdr()
+        repo, sid = self.make_repo_session()
+        try:
+            rc, out1, err = self.run_cli(["add", sid, "--agent", "claude", "--task", "one"])
+            self.assertEqual(rc, 0, err)
+            rc, out2, err = self.run_cli(["add", sid, "--agent", "claude", "--task", "two"])
+            self.assertEqual(rc, 0, err)
+            names = [self.store.try_load(i.strip())["lane"]["name"] for i in (out1, out2)]
+            self.assertEqual(names, ["claude", "claude-2"])
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--lane", "claude", "--task", "dup"])
+            self.assertEqual(rc, 5)
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--lane", "main", "--task", "reserved"])
+            self.assertEqual(rc, 5)
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_a_lane_may_be_stricter_than_its_session_and_never_looser(self):
+        self.start_lane_herdr()
+        repo = self.make_git_repo_with_two_commits()
+        self._git(repo, "checkout", "main")
+        try:
+            rc, out, err = self.run_cli(["new", "--agent", "claude", "--mode", "shared", "--name", "strict",
+                                         "--cwd", str(repo)])
+            self.assertEqual(rc, 0, err)
+            sid = out.strip()
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--mode", "personal", "--task", "loosen"])
+            self.assertEqual(rc, 5)
+            self.assertIn("never looser", err)
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--mode", "restricted", "--task", "tighten"])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(self.store.try_load(out.strip())["mode"], "restricted")
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_lanes_lists_main_first_and_list_json_carries_lanes(self):
+        self.start_lane_herdr()
+        repo, sid = self.make_repo_session()
+        try:
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--lane", "tests", "--task", "Write the tests"])
+            self.assertEqual(rc, 0, err)
+            lane_id = out.strip()
+            rc, out, err = self.run_cli(["lanes", sid, "--json"])
+            self.assertEqual(rc, 0, err)
+            lanes = json.loads(out)["lanes"]
+            self.assertEqual([l["lane"] for l in lanes], ["main", "tests"])
+            self.assertEqual(lanes[1]["task"], "Write the tests")
+            self.assertEqual(lanes[1]["id"], lane_id)
+            rc, out, err = self.run_cli(["list", "--json"])
+            entries = {e["id"]: e for e in json.loads(out)["sessions"]}
+            self.assertEqual([l["lane"] for l in entries[sid]["lanes"]], ["tests"])
+            self.assertEqual(entries[lane_id]["lane"]["name"], "tests")
+            self.assertEqual(entries[lane_id]["lane"]["parent_name"], "team")
+            self.assertEqual(entries[sid]["lane"], None)
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_send_targets_one_lane_or_fans_out_to_every_live_lane(self):
+        self.start_lane_herdr()
+        repo, sid = self.make_repo_session()
+        try:
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--lane", "tests", "--task", "Write the tests"])
+            self.assertEqual(rc, 0, err)
+            lane_id = out.strip()
+            before = len(self.fake_herdr.calls("agent.prompt"))
+            rc, out, err = self.run_cli(["send", sid, "Keep the public API unchanged", "--lane", "tests"])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(len(self.fake_herdr.calls("agent.prompt")) - before, 1)
+            lane_texts = [e["data"]["text"] for e in self.store.read_events(lane_id) if e["type"] == "instruction.queued"]
+            self.assertIn("Keep the public API unchanged", lane_texts)
+            before = len(self.fake_herdr.calls("agent.prompt"))
+            rc, out, err = self.run_cli(["send", sid, "Ship by noon"])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(len(self.fake_herdr.calls("agent.prompt")) - before, 2)  # main and the lane
+            main_texts = [e["data"]["text"] for e in self.store.read_events(sid) if e["type"] == "instruction.queued"]
+            self.assertIn("Ship by noon", main_texts)
+            lane_texts = [e["data"]["text"] for e in self.store.read_events(lane_id) if e["type"] == "instruction.queued"]
+            self.assertIn("Ship by noon", lane_texts)
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_done_lane_kept_merges_its_branch_into_the_session_and_tells_the_parent(self):
+        self.start_lane_herdr()
+        repo, sid = self.make_repo_session()
+        try:
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--lane", "tests", "--task", "Write the tests"])
+            self.assertEqual(rc, 0, err)
+            lane_id = out.strip()
+            lane = self.store.try_load(lane_id)
+            wt = pathlib.Path(lane["workspace"]["worktree_path"])
+            (wt / "test_page.py").write_text("def test_page(): pass\n", encoding="utf-8")
+            self._git(wt, "add", "test_page.py")
+            self._git(wt, "-c", "user.email=lane@example.com", "-c", "user.name=Lane", "commit", "-m", "tests for the page")
+            rc, out, err = self.run_cli(["done", sid, "--lane", "tests", "--verdict", "kept", "--note", "tests pass"])
+            self.assertEqual(rc, 0, err)
+            parent = self.store.try_load(sid)
+            merged = [e for e in self.store.read_events(sid) if e["type"] == "lane.merged"]
+            self.assertEqual(len(merged), 1)
+            self.assertEqual(merged[0]["data"]["lane"], "tests")
+            self.assertEqual(len(merged[0]["data"]["commits"]), 1)
+            # The session's branch now has the lane's commit.
+            log = self._git(pathlib.Path(parent["workspace"]["worktree_path"]), "log", "--oneline", "session/team").stdout
+            self.assertIn("tests for the page", log)
+            self.assertEqual(self.store.try_load(lane_id)["status"]["state"], "done")
+            # The completion path: the parent records child.completed and got a marked instruction.
+            completed = [e for e in self.store.read_events(sid) if e["type"] == "child.completed"]
+            self.assertEqual(completed[0]["data"]["lane"], "tests")
+            self.assertEqual(completed[0]["data"]["state"], "done")
+            queued = [e for e in self.store.read_events(sid) if e["type"] == "instruction.queued"]
+            self.assertTrue(any("lane tests finished" in e["data"]["text"] for e in queued))
+            # The session's receipt lists the lane with its merged commit.
+            rc, out, err = self.run_cli(["done", sid, "--verdict", "kept", "--note", "page and tests"])
+            self.assertEqual(rc, 0, err)
+            receipt = json.loads(self.store.receipt_path(sid).read_text())
+            self.assertEqual(receipt["lanes"][0]["lane"], "tests")
+            self.assertEqual(len(receipt["lanes"][0]["merged_commits"]), 1)
+            self.assertEqual(receipt["lanes"][0]["end_state"], "done")
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_done_lane_with_a_conflict_blocks_the_lane_and_loses_nothing(self):
+        self.start_lane_herdr()
+        repo, sid = self.make_repo_session()
+        try:
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--lane", "copy", "--task", "Rewrite the README"])
+            self.assertEqual(rc, 0, err)
+            lane_id = out.strip()
+            lane = self.store.try_load(lane_id)
+            parent = self.store.try_load(sid)
+            lwt = pathlib.Path(lane["workspace"]["worktree_path"])
+            pwt = pathlib.Path(parent["workspace"]["worktree_path"])
+            (lwt / "README.md").write_text("lane version\n", encoding="utf-8")
+            self._git(lwt, "add", "README.md"); self._git(lwt, "-c", "user.email=l@x", "-c", "user.name=L", "commit", "-m", "lane readme")
+            (pwt / "README.md").write_text("session version\n", encoding="utf-8")
+            self._git(pwt, "add", "README.md"); self._git(pwt, "-c", "user.email=p@x", "-c", "user.name=P", "commit", "-m", "session readme")
+            rc, out, err = self.run_cli(["done", sid, "--lane", "copy", "--verdict", "kept", "--note", "copy is good"])
+            self.assertEqual(rc, 5)
+            lane = self.store.try_load(lane_id)
+            self.assertEqual(lane["status"]["state"], "blocked")
+            self.assertTrue(lane["status"]["detail"].startswith("merge conflict"))
+            # The merge was aborted: the session's tree is clean and both commits still exist.
+            self.assertEqual(self._git(pwt, "status", "--porcelain").stdout.strip(), "")
+            self.assertIn("lane readme", self._git(lwt, "log", "--oneline").stdout)
+            self.assertEqual([e for e in self.store.read_events(sid) if e["type"] == "lane.merged"], [])
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_add_refuses_an_ended_or_unbound_session(self):
+        self.start_lane_herdr()
+        sid = make_bare_session(self.store, "orphan", runtime=None, state="orphaned")
+        rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--task", "x"])
+        self.assertEqual(rc, 5)
+        sid2 = make_bare_session(self.store, "over", runtime=None, state="done")
+        rc, out, err = self.run_cli(["add", sid2, "--agent", "claude", "--task", "x"])
+        self.assertEqual(rc, 5)
+
+    def test_stop_keep_lanes_leaves_the_lanes_running(self):
+        self.start_lane_herdr()
+        repo, sid = self.make_repo_session()
+        try:
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--lane", "tests", "--task", "t"])
+            self.assertEqual(rc, 0, err)
+            lane_id = out.strip()
+            rc, out, err = self.run_cli(["stop", sid, "--keep-lanes"])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(self.store.try_load(sid)["status"]["state"], "stopped")
+            self.assertEqual(self.store.try_load(lane_id)["status"]["state"], "working")
+            rc, out, err = self.run_cli(["stop", sid, "--lane", "tests"])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(self.store.try_load(lane_id)["status"]["state"], "stopped")
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# Pattern 06, event-driven state: watchers, coalesced notices, delivery
+# --------------------------------------------------------------------------
+
+class TestWatchers(TestLanes):
+    def test_a_parent_watches_its_lane_and_gets_one_coalesced_notice(self):
+        self.start_lane_herdr()
+        repo, sid = self.make_repo_session()
+        try:
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--lane", "tests", "--task", "Write the tests"])
+            self.assertEqual(rc, 0, err)
+            lane_id = out.strip()
+            lane = self.store.try_load(lane_id)
+            self.assertEqual([w["session_id"] for w in lane["watchers"]], [sid])
+            # Two events on the lane before anything is delivered: one pending notice on the parent, updated.
+            note = self.plain_dir / "n.txt"; note.write_text("x\n")
+            rc, out, err = self.run_cli(["artifact-add", lane_id, "--kind", "file", "--source", str(note), "--label", "first"])
+            self.assertEqual(rc, 0, err)
+            rc, out, err = self.run_cli(["artifact-add", lane_id, "--kind", "file", "--source", str(note), "--label", "second"])
+            self.assertEqual(rc, 0, err)
+            parent = self.store.try_load(sid)
+            watch = [q for q in parent["queue"] if q.get("delivery") == "watch"]
+            self.assertEqual(len(watch), 1)
+            self.assertEqual(watch[0]["origin_session"], lane_id)
+            # runtime.bound and starting -> working are noise to a watcher (run 9);
+            # the two artifacts are one coalesced notice.
+            self.assertEqual(watch[0]["count"], 2)
+            self.assertIn("artifact second", watch[0]["text"])
+            # Delivery on reconcile, when the parent is idle: one prompt, cursor advanced, queue clear.
+            lane = self.store.try_load(lane_id)
+            self.fake_herdr.set_result("agent.list", {"agents": [
+                {"name": "any", "agent_status": "idle", "interactive_ready": True, "agent_id": parent["runtime"]["agent_id"]},
+                {"name": "lane", "agent_status": "working", "interactive_ready": True, "agent_id": lane["runtime"]["agent_id"]}]})
+            self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": parent["runtime"]["pane_id"]}, {"pane_id": lane["runtime"]["pane_id"]}]})
+            before = len(self.fake_herdr.calls("agent.prompt"))
+            rc, out, err = self.run_cli(["reconcile", "--json"])
+            self.assertEqual(rc, 0, err)
+            prompts = self.fake_herdr.calls("agent.prompt")[before:]
+            watch_prompts = [p for p in prompts if "tests" in p.get("text", "") and "artifact second" in p.get("text", "")]
+            self.assertEqual(len(watch_prompts), 1)
+            parent = self.store.try_load(sid)
+            self.assertEqual([q for q in parent["queue"] if q.get("delivery") == "watch"], [])
+            lane = self.store.try_load(lane_id)
+            self.assertEqual(lane["watchers"][0]["cursor"], watch[0]["seq_to"])
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_instruction_traffic_never_wakes_a_watcher(self):
+        self.start_lane_herdr()
+        repo, sid = self.make_repo_session()
+        try:
+            rc, out, err = self.run_cli(["add", sid, "--agent", "claude", "--lane", "tests", "--task", "Write the tests"])
+            self.assertEqual(rc, 0, err)
+            lane_id = out.strip()
+            parent_before = [q for q in self.store.try_load(sid)["queue"] if q.get("delivery") == "watch"]
+            rc, out, err = self.run_cli(["send", sid, "Keep going", "--lane", "tests"])
+            self.assertEqual(rc, 0, err)
+            parent_after = [q for q in self.store.try_load(sid)["queue"] if q.get("delivery") == "watch"]
+            self.assertEqual(len(parent_after), len(parent_before))
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_subscribe_adds_and_removes_a_watcher_and_log_since_reads_forward(self):
+        self.start_fake_herdr()
+        a = make_bare_session(self.store, "watched", runtime=None, state="idle")
+        b = make_bare_session(self.store, "watcher", runtime=None, state="idle")
+        rc, out, err = self.run_cli(["subscribe", a, "--watcher", b])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([w["session_id"] for w in self.store.try_load(a)["watchers"]], [b])
+        rc, out, err = self.run_cli(["goal", a, "--set", "a new goal"]) if False else (0, "", "")
+        note = self.plain_dir / "m.txt"; note.write_text("y\n")
+        rc, out, err = self.run_cli(["artifact-add", a, "--kind", "file", "--source", str(note), "--label", "one"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len([q for q in self.store.try_load(b)["queue"] if q.get("delivery") == "watch"]), 1)
+        last = self.store._last_seq(a)
+        rc, out, err = self.run_cli(["log", a, "--since", str(last - 1), "--json"])
+        self.assertEqual(rc, 0, err)
+        rows = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual([r["seq"] for r in rows], [last])
+        rc, out, err = self.run_cli(["subscribe", a, "--watcher", b, "--remove"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.store.try_load(a)["watchers"], [])
+
+    def test_open_delivers_what_was_queued_while_orphaned(self):
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [{"name": "any", "agent_status": "idle", "interactive_ready": True}]})
+        self.fake_herdr.set_result("agent.prompt", {"agent": {"agent_status": "working"}})
+        sid = make_bare_session(self.store, "orphan-queue", runtime=None, state="orphaned")
+        rc, out, err = self.run_cli(["send", sid, "Finish the footer"])
+        self.assertEqual(rc, 0, err)   # queued, no runtime
+        self.assertEqual(len(self.store.try_load(sid)["queue"]), 1)
+        before = len(self.fake_herdr.calls("agent.prompt"))
+        rc, out, err = self.run_cli(["open", sid])
+        self.assertEqual(rc, 0, err)
+        prompts = self.fake_herdr.calls("agent.prompt")[before:]
+        self.assertTrue(any("Finish the footer" in p.get("text", "") for p in prompts))
+        self.assertEqual(self.store.try_load(sid)["queue"], [])
+        types = [e["type"] for e in self.store.read_events(sid)]
+        self.assertIn("instruction.delivered", types)
+
+
+class TestArtifactLinksAndStates(CoreTestCase):
+    def test_url_artifact_shows_as_a_link_and_can_be_marked_live(self):
+        # 09-closed-loop-surfaces.md sections 4 and 6.
+        self.start_fake_herdr()
+        sid = make_bare_session(self.store, "linky", runtime=None, state="idle", goal_text="a page")
+        rc, out, err = self.run_cli(["artifact-add", sid, "--kind", "url", "--source", "https://www.figma.com/file/abc/frame", "--label", "frame"])
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.run_cli(["show", sid, "--loop"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("artifact     frame  https://www.figma.com/file/abc/frame", out)
+        rc, out, err = self.run_cli(["artifact-mark", sid, "frame", "--state", "live"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip(), "frame: live")
+        index = core.read_artifacts_index(self.store.artifacts_dir(sid))
+        self.assertEqual(index[0]["state"], "live")
+        self.assertEqual(index[0]["kind"], "url")
+        rc, out, err = self.run_cli(["show", sid, "--loop"])
+        self.assertIn("artifact     frame  marked live", out)
+        rc, out, err = self.run_cli(["done", sid, "--verdict", "kept", "--note", "shipped"])
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.run_cli(["receipt", sid])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("https://www.figma.com/file/abc/frame   frame   live", out)
+        rc, out, err = self.run_cli(["artifact-mark", sid, "nothing-here", "--state", "live"])
+        self.assertEqual(rc, 3)
