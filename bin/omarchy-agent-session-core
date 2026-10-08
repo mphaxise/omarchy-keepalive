@@ -259,6 +259,39 @@ def atomic_write_text(path, text):
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
         raise
+    # The rename is durable only once the directory entry is: fsync the
+    # directory too, so a power cut right after the replace keeps the new
+    # file rather than the old one with a stray temp beside it.
+    with contextlib.suppress(OSError):
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+
+STALE_TMP_S = 60
+
+
+def remove_stale_tmp_files(root, max_age_s=STALE_TMP_S):
+    """Delete the `.<name>.*.tmp` files atomic_write_text leaves behind when
+    the process is killed between mkstemp and os.replace (the watcher kills
+    a reconcile at 30 s; a power cut does the same). Only in `root` and its
+    session directories, only files older than `max_age_s`, so a write in
+    flight in another process is never touched. Returns the paths removed."""
+    root = pathlib.Path(root)
+    if not root.is_dir():
+        return []
+    cutoff = time.time() - max_age_s
+    removed = []
+    dirs = [root] + [p for p in root.iterdir() if p.is_dir()]
+    for d in dirs:
+        for tmp in d.glob(".*.tmp"):
+            with contextlib.suppress(OSError):
+                if tmp.is_file() and tmp.stat().st_mtime < cutoff:
+                    tmp.unlink()
+                    removed.append(tmp)
+    return removed
 
 
 def atomic_write_json(path, obj):
@@ -4136,6 +4169,7 @@ def sweep_ended_workspaces(ctx, known, live_agents, live_panes):
 
 def cmd_reconcile(args, ctx):
     actor = system_actor()
+    remove_stale_tmp_files(ctx.store.root)
     known = ctx.store.list_sessions()
     try:
         live_panes = ctx.herdr.pane_list() or []

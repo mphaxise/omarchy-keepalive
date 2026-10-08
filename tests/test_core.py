@@ -1638,6 +1638,17 @@ class TestReconcile(CoreTestCase):
         self.assertEqual(index["orphaned"], [session_id])
         self.assertEqual(index["counts"], {"needs_attention": 1, "live": 1, "orphaned": 1, "paused": 0})
 
+    def test_reconcile_removes_a_stale_index_temp_file(self):
+        self.start_fake_herdr()
+        stray = self.sessions_dir / ".index.json.k1ll3d.tmp"
+        stray.write_text("{", encoding="utf-8")
+        old = time.time() - 600
+        os.utime(stray, (old, old))
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(stray.exists())
+        self.assertEqual(sorted(p.name for p in self.sessions_dir.iterdir()), ["index.json"])
+
     def test_reconcile_index_write_failure_changes_neither_exit_code_nor_output(self):
         # A directory squatting on index.json makes the atomic rename fail.
         squatter = self.sessions_dir / "index.json"
@@ -1686,6 +1697,30 @@ class TestAtomicWrite(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"a": 2})
             leftovers = [p for p in path.parent.iterdir() if p.name != "session.json"]
             self.assertEqual(leftovers, [])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_stale_temp_files_are_removed_but_fresh_ones_kept(self):
+        # A reconcile killed between mkstemp and os.replace (the watcher's
+        # 30 s timeout, a power cut) leaves `.index.json.XXXX.tmp` behind;
+        # the next reconcile removes the old ones and leaves a write in
+        # flight alone.
+        d = pathlib.Path(tempfile.mkdtemp())
+        try:
+            (d / "sess").mkdir()
+            old_root = d / ".index.json.abc.tmp"
+            old_sess = d / "sess" / ".session.json.abc.tmp"
+            fresh = d / ".index.json.def.tmp"
+            for p in (old_root, old_sess, fresh):
+                p.write_text("{}", encoding="utf-8")
+            stale = time.time() - 600
+            os.utime(old_root, (stale, stale))
+            os.utime(old_sess, (stale, stale))
+            removed = core.remove_stale_tmp_files(d)
+            self.assertEqual(sorted(removed), sorted([old_root, old_sess]))
+            self.assertTrue(fresh.exists())
+            self.assertFalse(old_root.exists())
+            self.assertFalse(old_sess.exists())
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
