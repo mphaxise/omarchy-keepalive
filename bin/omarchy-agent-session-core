@@ -3967,16 +3967,28 @@ def discover_harness_session_ref(kind, cwd, since_epoch, taken=()):
     return candidates[0][1]
 
 
-def record_harness_session_ref(store, session, herdr=None):
+def agent_session_value(agent):
+    """The harness's own conversation id as Herdr reports it on an
+    agent.list entry (`agent_session.value`), or None."""
+    return ((agent or {}).get("agent_session") or {}).get("value") or None
+
+
+def record_harness_session_ref(store, session, herdr=None, live=None):
     """Fill agent.harness_session_ref when it is missing and discoverable,
     and tell Herdr through pane.report_agent_session so its sidebar and a
-    later attach agree with the record. Returns True when something was
-    recorded."""
+    later attach agree with the record. `live` is the session's agent.list
+    entry when the caller holds one: the id Herdr reports there is taken
+    first. Returns True when something was recorded."""
     if session["agent"].get("harness_session_ref"):
         return False
     runtime = session.get("runtime")
     if runtime is None:
         return False
+    value = agent_session_value(live)
+    if value:
+        session["agent"]["harness_session_ref"] = value
+        store.save_session(session)
+        return True
     cwd = (session.get("workspace") or {}).get("worktree_path")
     try:
         since = dt.datetime.fromisoformat(session["created_at"].replace("Z", "+00:00")).timestamp()
@@ -4181,7 +4193,7 @@ def cmd_reconcile(args, ctx):
             live = next((a for a in live_agents if a.get("agent_id") == agent_id), None)
             if live is not None:
                 apply_herdr_status(ctx.store, s, live.get("agent_status"))
-                record_harness_session_ref(ctx.store, s, ctx.herdr)
+                record_harness_session_ref(ctx.store, s, ctx.herdr, live=live)
                 # pattern 06: pending watch notices reach a live watcher on
                 # the next tick, between its turns.
                 if any(q.get("delivery") == "watch" for q in s.get("queue") or []) and (live.get("agent_status") in ("idle", "done")):
@@ -4275,13 +4287,20 @@ def cmd_reconcile(args, ctx):
         name = f"herdr-{a.get('name') or agent_id}"
         runtime = {"backend": "herdr", "session": a.get("session"), "workspace_id": a.get("workspace_id"),
                    "tab_id": a.get("tab_id"), "pane_id": a.get("pane_id"), "agent_id": agent_id}
-        workspace = {"repo_root": None, "worktree_path": None, "branch": None, "base_branch": None, "created_by_session": False}
+        # The directory the agent runs in, so a revive starts the harness
+        # where its transcript lives.
+        cwd = a.get("cwd") or None
+        workspace = {"repo_root": None, "worktree_path": cwd, "branch": None, "base_branch": None, "created_by_session": False}
         # Mode is unknown for an externally-started agent; "shared" is this
         # build's conservative default since Personal's trust model (a
         # human already watching) can't be asserted for a pane omarchy
         # didn't launch -- see README-core.md.
         record = new_session_record(session_id, name, actor, actor, "shared", a.get("kind", "unknown"),
-                                     workspace, cwd=None, command=None)
+                                     workspace, cwd=cwd, command=None)
+        # The conversation Herdr already names on the agent.list entry: an
+        # adopted record has no start time of its own to discover the
+        # transcript from, and without the id a revive starts a fresh one.
+        record["agent"]["harness_session_ref"] = agent_session_value(a)
         ctx.store.append_event(session_id, "session.created", actor, {"name": name, "adopted": True})
         record["state_version"] = 1
         ctx.store.save_session(record)

@@ -1517,6 +1517,52 @@ class TestReconcile(CoreTestCase):
         self.assertEqual(session["runtime"]["agent_id"], "orphan-agent")
         self.assertEqual(session["status"]["state"], "working")
 
+    def test_reconcile_adopts_with_the_conversation_and_cwd_herdr_reports(self):
+        # An adopted agent has no start time of its own to discover a
+        # transcript from; Herdr's agent.list already names the
+        # conversation and the directory, so the record carries both from
+        # its first tick and a revive resumes that conversation there.
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "0"
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [
+            {"name": "stray", "agent": "claude", "pane_id": "p9", "workspace_id": "w9", "cwd": str(self.plain_dir),
+             "agent_session": {"agent": "claude", "kind": "id", "source": "herdr:claude", "value": "conv-123"}}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p9"}]})
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        adopted_id = json.loads(out)["adopted"][0]
+        session = self.store.try_load(adopted_id)
+        self.assertEqual(session["agent"]["harness_session_ref"], "conv-123")
+        self.assertEqual(session["workspace"]["worktree_path"], str(self.plain_dir))
+        self.assertFalse(session["workspace"]["created_by_session"])
+
+        # Herdr loses the pane; Enter resumes the same conversation in the
+        # same directory instead of starting a fresh one.
+        self.fake_herdr.set_result("agent.list", {"agents": []})
+        self.fake_herdr.set_result("pane.list", {"panes": []})
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(json.loads(out)["orphaned"], [adopted_id])
+        self.fake_herdr.set_result("agent.start", {"agent_id": "stray-2", "pane_id": "p10"})
+        self.fake_herdr.set_result("agent.get", {"agent": {"name": "stray-2"}})
+        with mock.patch.object(core.subprocess, "Popen"):
+            rc, out, err = self.run_cli(["open", adopted_id])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.fake_herdr.calls("workspace.create")[-1]["cwd"], str(self.plain_dir))
+        args = self.fake_herdr.calls("agent.start")[-1]["args"]
+        self.assertEqual(args[:2], ["--resume", "conv-123"])
+
+    def test_reconcile_fills_a_missing_ref_from_the_agent_list_entry(self):
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [
+            {"name": "a1", "agent": "claude", "pane_id": "p1", "agent_status": "idle",
+             "agent_session": {"kind": "id", "value": "conv-456"}}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p1"}]})
+        runtime = {"backend": "herdr", "session": None, "workspace_id": "w1", "tab_id": "t1", "pane_id": "p1", "agent_id": "a1"}
+        session_id = make_bare_session(self.store, "bound", runtime=runtime, state="working")
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.store.try_load(session_id)["agent"]["harness_session_ref"], "conv-456")
+
     def test_reconcile_exits_4_when_herdr_unreachable(self):
         # No fake server started -- socket path has nothing listening.
         rc, out, err = self.run_cli(["reconcile"])
