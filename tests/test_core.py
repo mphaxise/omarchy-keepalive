@@ -1517,6 +1517,69 @@ class TestReconcile(CoreTestCase):
         self.assertEqual(session["runtime"]["agent_id"], "orphan-agent")
         self.assertEqual(session["status"]["state"], "working")
 
+    def test_reconcile_waits_for_the_store_lock_another_command_holds(self):
+        # The reconciler and the panel's commands each load, change and
+        # save records; they take turns through <store>/.lock.
+        import fcntl
+        self.start_fake_herdr()
+        env = dict(os.environ, OMARCHY_SESSIONS_LOCK_TIMEOUT_S="10")
+        lock_path = self.sessions_dir / ".lock"
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            proc = subprocess.Popen([sys.executable, str(CORE_PATH), "reconcile"], env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            time.sleep(1.0)
+            self.assertIsNone(proc.poll(), "reconcile ran while another command held the store lock")
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            out, err = proc.communicate(timeout=20)
+        finally:
+            os.close(fd)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("going on without it", err)
+
+    def test_store_lock_gives_up_after_the_timeout_and_is_reentrant(self):
+        import fcntl
+        lock_path = self.sessions_dir / ".lock"
+        self.sessions_dir.mkdir(exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            err = io.StringIO()
+            started = time.monotonic()
+            with contextlib.redirect_stderr(err):
+                with self.store.lock(timeout_s=0.3):
+                    with self.store.lock(timeout_s=0.3):   # re-entrant: no second wait
+                        pass
+            self.assertGreaterEqual(time.monotonic() - started, 0.3)
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertIn("going on without it", err.getvalue())
+        finally:
+            os.close(fd)
+
+    def test_sweep_leaves_a_pane_whose_record_was_revived_since_the_snapshot(self):
+        # `known` is loaded at the top of a reconcile; a revive in between
+        # bound the pane to the record. The sweep re-reads before closing.
+        self.start_fake_herdr()
+        session_id = make_bare_session(self.store, "revived-meanwhile", runtime=None, state="orphaned")
+        stale = self.store.try_load(session_id)                     # the snapshot: orphaned, unbound
+        runtime = {"backend": "herdr", "session": None, "workspace_id": "wZ", "tab_id": "wZ:t1", "pane_id": "wZ:p1", "agent_id": "a1"}
+        fresh = self.store.try_load(session_id)
+        ev = self.store.append_event(session_id, "runtime.bound", core.current_human_actor(), runtime)
+        fresh["runtime"] = runtime
+        fresh["state_version"] = ev["seq"]
+        self.store.save_session(fresh)
+        panes = [{"pane_id": "wZ:p1", "workspace_id": "wZ", "tokens": {"session_id": session_id}}]
+        ctx = core.Context(self.store, core.HerdrClient(self.herdr_socket))
+        swept = core.sweep_ended_workspaces(ctx, [stale], [], panes)
+        self.assertEqual(swept, [])
+        self.assertEqual(self.fake_herdr.calls("pane.close"), [])
+        # Unchanged since the snapshot: swept as before.
+        gone_id = make_bare_session(self.store, "really-ended", runtime=None, state="stopped")
+        panes = [{"pane_id": "wY:p1", "workspace_id": "wY", "tokens": {"session_id": gone_id}}]
+        swept = core.sweep_ended_workspaces(ctx, [self.store.try_load(gone_id)], [], panes)
+        self.assertEqual(swept, [gone_id])
+
     def test_reconcile_exits_4_when_herdr_unreachable(self):
         # No fake server started -- socket path has nothing listening.
         rc, out, err = self.run_cli(["reconcile"])
@@ -1649,8 +1712,8 @@ class TestReconcile(CoreTestCase):
         self.assertEqual(json.loads(out), {"orphaned": [], "adopted": [], "ended": [], "swept": []})
         self.assertIn("could not write", err)
         self.assertTrue(squatter.is_dir())
-        # No temp file left behind next to it either.
-        self.assertEqual([p.name for p in self.sessions_dir.iterdir()], ["index.json"])
+        # No temp file left behind next to it either (the lock file is the store's own).
+        self.assertEqual(sorted(p.name for p in self.sessions_dir.iterdir()), [".lock", "index.json"])
 
 
 # --------------------------------------------------------------------------
