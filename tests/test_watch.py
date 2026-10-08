@@ -21,6 +21,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 WATCH_PATH = Path(__file__).resolve().parent.parent / "bin" / "omarchy-agent-session-watch"
@@ -612,7 +613,122 @@ class TestCursorPersistenceAndRestart(WatchTestCase):
         self.assertEqual(data.get("s1"), 1)
 
 
+class TestScanCost(WatchTestCase):
+    """What a quiet second costs: no log re-read, no cursor rewrite, no
+    window probe (with 54 sessions: every log re-read in full and a
+    hyprctl probe once a second, for nothing)."""
+
+    def test_events_log_is_read_from_where_the_last_scan_stopped(self):
+        write_session(self.tmpdir, "s1", "api-refactor")
+        append_event(self.tmpdir, "s1", 1, "status.changed", {"from": "working", "to": "waiting"})
+        watcher = self.make_watcher()
+        watcher.scan_once(now=self.clock())
+        log = self.tmpdir / "s1" / "events.jsonl"
+        self.assertEqual(watcher._offsets["s1"], log.stat().st_size)
+        # Nothing appended: the file is not opened at all.
+        real_open = open
+        opened = []
+
+        def spy_open(path, *a, **k):
+            opened.append(str(path))
+            return real_open(path, *a, **k)
+        with unittest.mock.patch("builtins.open", spy_open):
+            watcher.scan_once(now=self.clock())
+        self.assertNotIn(str(log), opened)
+        # Appended: only the tail is read, and the notice goes out.
+        append_event(self.tmpdir, "s1", 2, "status.changed", {"from": "waiting", "to": "done"})
+        self.clock.advance(20.0)
+        watcher.scan_once(now=self.clock())
+        self.assertEqual(len(self.notifier.sent), 2)
+        self.assertEqual(watcher._offsets["s1"], log.stat().st_size)
+
+    def test_a_line_still_being_written_waits_for_the_next_scan(self):
+        write_session(self.tmpdir, "s1", "api-refactor")
+        watcher = self.make_watcher()
+        log = self.tmpdir / "s1" / "events.jsonl"
+        full = json.dumps({"seq": 1, "ts": "t", "type": "status.changed", "actor": {}, "data": {"from": "working", "to": "waiting"}})
+        log.write_text(full[:20])            # half a line, no newline yet
+        watcher.scan_once(now=self.clock())
+        self.assertEqual(self.notifier.sent, [])
+        log.write_text(full + "\n")           # the writer finished it
+        watcher.scan_once(now=self.clock())
+        self.assertEqual(len(self.notifier.sent), 1)
+
+    def test_a_log_rewritten_shorter_is_read_again_from_the_top(self):
+        write_session(self.tmpdir, "s1", "api-refactor")
+        append_event(self.tmpdir, "s1", 1, "status.changed", {"from": "working", "to": "waiting"})
+        append_event(self.tmpdir, "s1", 2, "status.changed", {"from": "waiting", "to": "working"})
+        watcher = self.make_watcher()
+        watcher.scan_once(now=self.clock())
+        self.assertEqual(len(self.notifier.sent), 1)
+        (self.tmpdir / "s1" / "events.jsonl").unlink()
+        append_event(self.tmpdir, "s1", 3, "status.changed", {"from": "working", "to": "blocked"})
+        self.clock.advance(20.0)
+        watcher.scan_once(now=self.clock())
+        self.assertEqual(len(self.notifier.sent), 2)
+
+    def test_cursor_file_is_rewritten_only_when_a_cursor_moved(self):
+        write_session(self.tmpdir, "s1", "api-refactor")
+        append_event(self.tmpdir, "s1", 1, "status.changed", {"from": "working", "to": "waiting"})
+        watcher = self.make_watcher()
+        watcher.scan_once(now=self.clock())
+        cursor_path = self.tmpdir / ".watch-cursors.json"
+        before = cursor_path.stat().st_mtime_ns
+        cursor_path.write_text(cursor_path.read_text())   # a marker: any rewrite replaces this inode
+        marker = cursor_path.stat().st_ino
+        watcher.scan_once(now=self.clock())
+        watcher.scan_once(now=self.clock())
+        self.assertEqual(cursor_path.stat().st_ino, marker, "cursors rewritten with nothing to record")
+        append_event(self.tmpdir, "s1", 2, "status.changed", {"from": "waiting", "to": "working"})
+        watcher.scan_once(now=self.clock())
+        self.assertEqual(json.loads(cursor_path.read_text())["s1"], 2)
+
+    def test_window_is_probed_only_when_a_scan_has_something_to_decide(self):
+        probes = []
+
+        def probe():
+            probes.append(1)
+            return {"class": "other", "fullscreen": False}
+        write_session(self.tmpdir, "s1", "api-refactor")
+        watcher = self.make_watcher(active_window_fn=probe)
+        watcher.scan_once(now=self.clock())
+        watcher.scan_once(now=self.clock())
+        self.assertEqual(len(probes), 0)
+        append_event(self.tmpdir, "s1", 1, "status.changed", {"from": "working", "to": "waiting"})
+        watcher.scan_once(now=self.clock())
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(len(self.notifier.sent), 1)
+
+    def test_fullscreen_hold_still_ends_on_a_quiet_scan(self):
+        state = {"fullscreen": True}
+        write_session(self.tmpdir, "s1", "api-refactor")
+        append_event(self.tmpdir, "s1", 1, "status.changed", {"from": "working", "to": "waiting"})
+        watcher = self.make_watcher(active_window_fn=lambda: {"fullscreen": state["fullscreen"]})
+        watcher.scan_once(now=self.clock())
+        self.assertEqual(self.notifier.sent, [])          # held
+        state["fullscreen"] = False
+        self.clock.advance(1.0)
+        watcher.scan_once(now=self.clock())                # no events, but a hold to end
+        self.assertEqual(len(self.notifier.sent), 1)
+
+
+class TestReconcilePacer(unittest.TestCase):
+    def test_nudges_are_coalesced_to_one_reconcile_per_two_seconds(self):
+        pacer = watch.ReconcilePacer(every=5.0, debounce=2.0)
+        self.assertTrue(pacer.due(100.0, nudged=False))    # first ever: run
+        self.assertFalse(pacer.due(100.5, nudged=True))    # a nudge inside the window: kept
+        self.assertFalse(pacer.due(101.0, nudged=True))    # another: still one pending
+        self.assertFalse(pacer.due(101.9, nudged=False))   # quiet tick before the window ends
+        self.assertTrue(pacer.due(102.1, nudged=False))    # window over: the pending nudge is served
+        self.assertFalse(pacer.due(103.0, nudged=False))   # no nudge, not yet five seconds
+        self.assertFalse(pacer.due(106.0, nudged=False))
+        self.assertTrue(pacer.due(107.2, nudged=False))    # the five-second floor
+        self.assertTrue(pacer.due(110.0, nudged=True))     # a nudge past the window runs at once
+        self.assertFalse(pacer.due(110.1, nudged=False))
+
+
 class TestDryRunPrintsArgv(WatchTestCase):
+
     def test_dry_run_prints_the_argv_instead_of_calling_the_real_binary(self):
         calls = []
 

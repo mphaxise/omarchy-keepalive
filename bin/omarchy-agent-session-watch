@@ -423,6 +423,12 @@ class SessionWatcher:
         self.active_window_fn = active_window_fn
         self.cursor_path = self.sessions_dir / CURSOR_FILENAME
         self.cursors: dict[str, int] = self._load_cursors()
+        self._cursors_dirty = False
+        # session_id -> byte offset in its events.jsonl up to which every
+        # line has been read, so a scan reads only what was appended since.
+        # In memory only: a restart reads each log once in full, filtered
+        # by the cursors.
+        self._offsets: dict[str, int] = {}
 
         self._last_sent: dict[str, tuple] = {}  # session_id -> (ts, notif_id)
         # session_id -> (ts, kind) of that session's most recent notify-worthy
@@ -451,11 +457,14 @@ class SessionWatcher:
         return {}
 
     def _save_cursors(self) -> None:
+        if not self._cursors_dirty:
+            return  # nothing moved: no rewrite once a second for nothing
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.cursor_path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.cursors, f)
         tmp.replace(self.cursor_path)  # atomic, matching session.json's own convention
+        self._cursors_dirty = False
 
     # -- reading session state --
 
@@ -477,9 +486,25 @@ class SessionWatcher:
         cursor = self.cursors.get(session_id, 0)
         events = []
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
+            size = os.stat(path).st_size
+        except FileNotFoundError:
+            return []
+        offset = self._offsets.get(session_id, 0)
+        if size == offset:
+            return []  # nothing appended since the last scan
+        if size < offset:
+            offset = 0  # rewritten shorter: read it again from the top
+        try:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                while True:
+                    raw = f.readline()
+                    if not raw:
+                        break
+                    if not raw.endswith(b"\n"):
+                        break  # a line still being written: next scan
+                    offset = f.tell()
+                    line = raw.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
                     try:
@@ -496,6 +521,7 @@ class SessionWatcher:
                         events.append(ev)
         except FileNotFoundError:
             return []
+        self._offsets[session_id] = offset
         events.sort(key=lambda e: e.get("seq", 0))
         return events
 
@@ -510,22 +536,37 @@ class SessionWatcher:
         if now is None:
             now = self.clock()
 
-        window = self._safe_active_window()
-        fullscreen_now = is_fullscreen(window)
-        if self._was_fullscreen and not fullscreen_now:
-            self._flush_held(now)
-        self._was_fullscreen = fullscreen_now
+        # The window probe (hyprctl) runs once per scan and only when the
+        # scan has something to decide with it: a notice to classify, or a
+        # fullscreen hold to end. A quiet second costs nothing.
+        probe = {}
+
+        def window_state():
+            if not probe:
+                window = self._safe_active_window()
+                fullscreen_now = is_fullscreen(window)
+                if self._was_fullscreen and not fullscreen_now:
+                    self._flush_held(now)
+                self._was_fullscreen = fullscreen_now
+                probe["window"], probe["fullscreen"] = window, fullscreen_now
+            return probe["window"], probe["fullscreen"]
+
+        if self._was_fullscreen or self._held or self._held_digest is not None:
+            window_state()
 
         for session_id in self._session_ids():
             events = self._read_new_events(session_id)
             if not events:
                 continue
+            window, fullscreen_now = window_state()
             record = self._read_session_record(session_id)
             max_seq = self.cursors.get(session_id, 0)
             for ev in events:
                 self._handle_event(session_id, record, ev, now, window, fullscreen_now)
                 max_seq = max(max_seq, ev.get("seq", 0))
-            self.cursors[session_id] = max_seq
+            if self.cursors.get(session_id) != max_seq:
+                self.cursors[session_id] = max_seq
+                self._cursors_dirty = True
 
         self._save_cursors()
 
@@ -727,6 +768,38 @@ def herdr_nudge_thread(wake_event: threading.Event, stop_event: threading.Event)
             backoff = min(backoff * 2, 30.0)
 
 
+# --- reconcile pacing --------------------------------------------------
+
+RECONCILE_EVERY_S = 5.0
+RECONCILE_DEBOUNCE_S = 2.0
+
+
+class ReconcilePacer:
+    """When the run loop should run `reconcile`: at least every `every`
+    seconds, and on a Herdr nudge, but never twice within `debounce`
+    seconds. Herdr sends pane.updated on every status flicker, which with
+    agents working meant a reconcile a second, each one a full pass over
+    the store and two Herdr calls. A nudge that lands inside the window
+    is kept and served once it ends, so no event is lost, only
+    coalesced."""
+
+    def __init__(self, every: float = RECONCILE_EVERY_S, debounce: float = RECONCILE_DEBOUNCE_S):
+        self.every = every
+        self.debounce = debounce
+        self.last = float("-inf")
+        self.pending = False
+
+    def due(self, now: float, nudged: bool) -> bool:
+        if nudged:
+            self.pending = True
+        since = now - self.last
+        if since >= self.every or (self.pending and since >= self.debounce):
+            self.last = now
+            self.pending = False
+            return True
+        return False
+
+
 # --- CLI --------------------------------------------------------------
 
 
@@ -779,16 +852,12 @@ def main(argv: Optional[list] = None) -> int:
     # Herdr's agent status). The watcher is the one long-lived process, so
     # it runs `reconcile` on every Herdr nudge and at least every
     # `reconcile_every` seconds; a failure is logged and never fatal.
-    reconcile_every = 5.0
-    last_reconcile = 0.0
+    pacer = ReconcilePacer(every=RECONCILE_EVERY_S, debounce=RECONCILE_DEBOUNCE_S)
     reconcile_cmd = shutil.which("omarchy-agent-session-reconcile") or "omarchy-agent-session-reconcile"
 
-    def reconcile(force: bool) -> None:
-        nonlocal last_reconcile
-        now = time.monotonic()
-        if not force and now - last_reconcile < reconcile_every:
+    def reconcile(nudged: bool) -> None:
+        if not pacer.due(time.monotonic(), nudged):
             return
-        last_reconcile = now
         try:
             subprocess.run([reconcile_cmd], capture_output=True, text=True, timeout=30, check=False)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -798,7 +867,7 @@ def main(argv: Optional[list] = None) -> int:
         while True:
             nudged = wake_event.is_set()
             wake_event.clear()
-            reconcile(force=nudged)
+            reconcile(nudged)
             watcher.scan_once()
             wake_event.wait(args.interval)
     except KeyboardInterrupt:
