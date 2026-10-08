@@ -1517,6 +1517,103 @@ class TestReconcile(CoreTestCase):
         self.assertEqual(session["runtime"]["agent_id"], "orphan-agent")
         self.assertEqual(session["status"]["state"], "working")
 
+    def _orphan_with_ref(self, name, ref, state="orphaned"):
+        session_id = make_bare_session(self.store, name, runtime=None, state=state)
+        record = self.store.try_load(session_id)
+        record["agent"]["harness_session_ref"] = ref
+        if state == "stopped":
+            record["status"]["detail"] = "stopped"
+        self.store.save_session(record)
+        return session_id
+
+    def test_reconcile_rebinds_an_orphaned_record_whose_conversation_runs_again(self):
+        # After a Herdr outage the person restarted Claude by hand with
+        # --resume; the agent carries the conversation id, the record has
+        # no runtime. Before: adopted as a new record, old one orphaned and
+        # revivable beside it. Now: the old record is bound to that agent.
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "0"
+        session_id = self._orphan_with_ref("api-refactor", "conv-1")
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [
+            {"name": "claude-code-11", "agent": "claude", "pane_id": "w7:p1", "workspace_id": "w7", "tab_id": "w7:t1",
+             "agent_status": "idle", "agent_session": {"kind": "id", "value": "conv-1"}}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "w7:p1", "workspace_id": "w7"}]})
+        self.fake_herdr.set_result("agent.rename", {"type": "ok"})
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        result = json.loads(out)
+        self.assertEqual(result["rebound"], [session_id])
+        self.assertEqual(result["adopted"], [])
+        self.assertEqual(len(self.store.list_sessions()), 1)
+        record = self.store.try_load(session_id)
+        self.assertEqual(record["status"]["state"], "idle")
+        self.assertEqual(record["runtime"]["pane_id"], "w7:p1")
+        self.assertEqual(record["runtime"]["agent_id"], "api-refactor")   # renamed to the record's alias
+        self.assertEqual(self.fake_herdr.calls("agent.rename"), [{"target": "w7:p1", "name": "api-refactor"}])
+        self.assertEqual(self.fake_herdr.calls("pane.report_metadata")[-1]["tokens"], {"session_id": session_id})
+        self.assertEqual(self.fake_herdr.calls("pane.close"), [])
+        types = [e["type"] for e in self.store.read_events(session_id)]
+        self.assertEqual(types[-2:], ["runtime.bound", "status.changed"])
+        # Nothing to adopt on the next tick either.
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(json.loads(out)["adopted"], [])
+        self.assertEqual(len(self.store.list_sessions()), 1)
+
+    def test_reconcile_rebinds_a_stopped_record_through_orphaned(self):
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "0"
+        session_id = self._orphan_with_ref("stopped-then-resumed", "conv-2", state="stopped")
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [
+            {"name": "stopped-then-resumed", "agent": "claude", "pane_id": "p2", "agent_status": "working",
+             "agent_session": {"kind": "id", "value": "conv-2"}}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p2"}]})
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["rebound"], [session_id])
+        record = self.store.try_load(session_id)
+        self.assertEqual(record["status"]["state"], "working")
+        self.assertEqual(self.fake_herdr.calls("agent.rename"), [])   # already the alias
+        transitions = [(e["data"]["from"], e["data"]["to"]) for e in self.store.read_events(session_id) if e["type"] == "status.changed"]
+        self.assertEqual(transitions[-2:], [("stopped", "orphaned"), ("orphaned", "working")])
+
+    def test_reconcile_rebinds_the_orphaned_record_over_a_stopped_twin(self):
+        # Two records for one conversation (a stop, then a revive that got
+        # orphaned): the orphaned one is the live one's record.
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "0"
+        stopped_id = self._orphan_with_ref("twin-stopped", "conv-3", state="stopped")
+        orphan_id = self._orphan_with_ref("twin-orphaned", "conv-3")
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [
+            {"name": "claude-code-12", "agent": "claude", "pane_id": "p3", "agent_session": {"kind": "id", "value": "conv-3"}}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p3"}]})
+        self.fake_herdr.set_result("agent.rename", {"type": "ok"})
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["rebound"], [orphan_id])
+        self.assertEqual(self.store.try_load(stopped_id)["status"]["state"], "stopped")
+        self.assertEqual(self.store.try_load(orphan_id)["status"]["state"], "working")
+
+    def test_reconcile_rebinds_a_record_orphaned_while_its_agent_kept_running(self):
+        # A tick that lost the pane orphaned the record; the agent went on
+        # running under the record's alias in a pane stamped with its id.
+        # Such a pane is never adopted, so before this the record stayed
+        # orphaned and Enter started a second copy of the conversation.
+        os.environ["OMARCHY_ADOPT_GRACE_S"] = "0"
+        session_id = self._orphan_with_ref("still-running", "conv-4")
+        alias = core.derive_herdr_alias("still-running", session_id)
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [
+            {"name": alias, "agent": "claude", "pane_id": "p4", "agent_status": "working",
+             "agent_session": {"kind": "id", "value": "conv-4"}}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p4", "tokens": {"session_id": session_id}}]})
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["rebound"], [session_id])
+        record = self.store.try_load(session_id)
+        self.assertEqual(record["status"]["state"], "working")
+        self.assertEqual(record["runtime"]["agent_id"], alias)
+        self.assertEqual(self.fake_herdr.calls("agent.rename"), [])
+
     def test_reconcile_exits_4_when_herdr_unreachable(self):
         # No fake server started -- socket path has nothing listening.
         rc, out, err = self.run_cli(["reconcile"])
@@ -1548,7 +1645,7 @@ class TestReconcile(CoreTestCase):
 
         rc, out, err = self.run_cli(["reconcile", "--json"])
         self.assertEqual(rc, 0, err)
-        self.assertEqual(json.loads(out), {"orphaned": [gone_id], "adopted": [], "ended": [], "swept": []})  # stdout shape unchanged
+        self.assertEqual(json.loads(out), {"orphaned": [gone_id], "adopted": [], "ended": [], "swept": [], "rebound": []})  # stdout shape unchanged
 
         index = self.read_index()
         self.assertEqual(index["herdr"], "running")
@@ -1646,7 +1743,7 @@ class TestReconcile(CoreTestCase):
         self.start_fake_herdr()
         rc, out, err = self.run_cli(["reconcile", "--json"])
         self.assertEqual(rc, 0, err)
-        self.assertEqual(json.loads(out), {"orphaned": [], "adopted": [], "ended": [], "swept": []})
+        self.assertEqual(json.loads(out), {"orphaned": [], "adopted": [], "ended": [], "swept": [], "rebound": []})
         self.assertIn("could not write", err)
         self.assertTrue(squatter.is_dir())
         # No temp file left behind next to it either.
