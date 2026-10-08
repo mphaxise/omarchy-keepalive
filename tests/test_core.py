@@ -85,6 +85,10 @@ class CoreTestCase(unittest.TestCase):
         self.plain_dir = pathlib.Path(tempfile.mkdtemp(prefix="omarchy-plain-"))
         os.environ["OMARCHY_SESSIONS_DIR"] = str(self.sessions_dir)
         os.environ["HERDR_SOCKET"] = str(self.herdr_socket)
+        # The runtime directory (presence, unknown agents, the Herdr failure
+        # count) is private to the test too, never the desktop's own.
+        self.runtime_dir = pathlib.Path(tempfile.mkdtemp(prefix="omarchy-xdg-"))
+        os.environ["XDG_RUNTIME_DIR"] = str(self.runtime_dir)
         self.store = core.SessionStore(self.sessions_dir)
         self.fake_herdr = None
 
@@ -93,7 +97,7 @@ class CoreTestCase(unittest.TestCase):
             self.fake_herdr.stop()
         os.environ.clear()
         os.environ.update(self._old_environ)
-        for d in (self.sessions_dir, self.herdr_dir, self.plain_dir, getattr(self, "worktrees_dir", None)):
+        for d in (self.sessions_dir, self.herdr_dir, self.plain_dir, self.runtime_dir, getattr(self, "worktrees_dir", None)):
             if d:
                 shutil.rmtree(d, ignore_errors=True)
         os.environ.pop("HERDR_WORKTREES_DIR", None)
@@ -1629,6 +1633,11 @@ class TestReconcile(CoreTestCase):
         session_id = make_bare_session(self.store, "bound-no-herdr", runtime=runtime, state="working")
         make_bare_session(self.store, "unbound-blocked", state="blocked")
 
+        # The first two ticks without a server change nothing and write no
+        # index; the third orphans (test_reconcile_orphans_only_on_the_third_tick).
+        for _ in range(core.HERDR_GONE_TICKS - 1):
+            rc, out, err = self.run_cli(["reconcile", "--json"])
+            self.assertEqual(rc, 4, err)
         rc, out, err = self.run_cli(["reconcile", "--json"])
         self.assertEqual(rc, 4, err)
         self.assertEqual(json.loads(out), {"orphaned": [session_id], "adopted": [], "herdr": "unreachable"})
@@ -1637,6 +1646,73 @@ class TestReconcile(CoreTestCase):
         self.assertEqual(index["herdr"], "unreachable")
         self.assertEqual(index["orphaned"], [session_id])
         self.assertEqual(index["counts"], {"needs_attention": 1, "live": 1, "orphaned": 1, "paused": 0})
+
+    def test_reconcile_orphans_only_on_the_third_tick_without_a_server(self):
+        # xenolaptop, 2026-10-08: a server that is restarting, or one tick
+        # that cannot connect, must not unbind every live session. Two
+        # ticks in a row leave the records and the index alone; the third
+        # orphans; a tick that gets through resets the count.
+        runtime = {"backend": "herdr", "session": "s1", "workspace_id": "w1",
+                   "tab_id": "t1", "pane_id": "p1", "agent_id": "a1"}
+        session_id = make_bare_session(self.store, "bound-no-herdr", runtime=runtime, state="working")
+        for n in (1, 2):
+            rc, out, err = self.run_cli(["reconcile", "--json"])
+            self.assertEqual(rc, 4, err)
+            self.assertEqual(json.loads(out)["orphaned"], [])
+            self.assertEqual(core.read_herdr_failures(), n)
+            self.assertEqual(self.store.try_load(session_id)["status"]["state"], "working")
+            self.assertFalse((self.sessions_dir / "index.json").exists())
+        # The server comes back: the count resets and nothing was lost.
+        self.start_fake_herdr()
+        self.fake_herdr.set_result("agent.list", {"agents": [{"name": "a1", "agent": "claude", "pane_id": "p1"}]})
+        self.fake_herdr.set_result("pane.list", {"panes": [{"pane_id": "p1"}]})
+        rc, out, err = self.run_cli(["reconcile", "--json"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(core.read_herdr_failures(), 0)
+        self.assertEqual(self.store.try_load(session_id)["status"]["state"], "working")
+        self.fake_herdr.stop()
+        self.fake_herdr = None
+        self.herdr_socket.unlink()
+        for _ in range(core.HERDR_GONE_TICKS):
+            rc, out, err = self.run_cli(["reconcile", "--json"])
+            self.assertEqual(rc, 4, err)
+        self.assertEqual(json.loads(out)["orphaned"], [session_id])
+        self.assertEqual(self.store.try_load(session_id)["status"]["state"], "orphaned")
+
+    def test_reconcile_never_unbinds_on_a_server_that_does_not_answer(self):
+        # A server that accepts the connection and then says nothing (busy,
+        # mid-restart, a timeout) is not a server that is gone: the records
+        # stay bound however many ticks it lasts, and the count stays zero.
+        runtime = {"backend": "herdr", "session": "s1", "workspace_id": "w1",
+                   "tab_id": "t1", "pane_id": "p1", "agent_id": "a1"}
+        session_id = make_bare_session(self.store, "bound-slow-herdr", runtime=runtime, state="working")
+        self.start_fake_herdr()
+
+        def no_reply(_params):
+            raise OSError("connection dropped before a reply")
+        self.fake_herdr.set_result("pane.list", no_reply)
+        for _ in range(core.HERDR_GONE_TICKS + 1):
+            rc, out, err = self.run_cli(["reconcile", "--json"])
+            self.assertEqual(rc, 4, err)
+            self.assertEqual(json.loads(out)["orphaned"], [])
+        self.assertEqual(core.read_herdr_failures(), 0)
+        self.assertEqual(self.store.try_load(session_id)["status"]["state"], "working")
+        self.assertIsNotNone(self.store.try_load(session_id)["runtime"])
+        self.assertFalse((self.sessions_dir / "index.json").exists())
+
+    def test_herdr_unavailable_says_whether_the_server_is_gone(self):
+        client = core.HerdrClient(self.herdr_socket)
+        with self.assertRaises(core.HerdrUnavailable) as cm:
+            client.agent_list()
+        self.assertTrue(cm.exception.gone)                 # no socket file
+        self.start_fake_herdr()
+
+        def no_reply(_params):
+            raise OSError("dropped")
+        self.fake_herdr.set_result("agent.list", no_reply)
+        with self.assertRaises(core.HerdrUnavailable) as cm:
+            client.agent_list()
+        self.assertFalse(cm.exception.gone)                # answered badly, not gone
 
     def test_reconcile_index_write_failure_changes_neither_exit_code_nor_output(self):
         # A directory squatting on index.json makes the atomic rename fail.

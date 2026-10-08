@@ -615,7 +615,18 @@ def derive_herdr_alias(name, session_id, existing_aliases=()):
 # --------------------------------------------------------------------------
 
 class HerdrUnavailable(Exception):
-    """Herdr's socket is absent, refused the connection, or timed out."""
+    """Herdr's socket is absent, refused the connection, or timed out.
+
+    `gone` is True only for the first two: no socket, or nothing listening
+    on it. A timeout, an empty reply, or a non-JSON line means the server
+    is there but slow or confused, and a caller that would take drastic
+    action on a dead server (the reconciler orphaning every bound session)
+    must not take it on a slow one (xenolaptop, 2026-10-08: one 5 s
+    timeout while agents were busy unbound seven live sessions)."""
+
+    def __init__(self, message, gone=False):
+        super().__init__(message)
+        self.gone = gone
 
 
 class HerdrError(Exception):
@@ -662,7 +673,8 @@ class HerdrClient:
             sock.connect(str(self.socket_path))
         except OSError as e:
             sock.close()
-            raise HerdrUnavailable(f"cannot reach Herdr socket at {self.socket_path}: {e}") from e
+            gone = isinstance(e, (FileNotFoundError, ConnectionRefusedError))
+            raise HerdrUnavailable(f"cannot reach Herdr socket at {self.socket_path}: {e}", gone=gone) from e
         return sock
 
     def call(self, method, params=None, timeout=None):
@@ -2187,6 +2199,32 @@ def write_unknown_agents(seen):
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(seen), encoding="utf-8")
+
+
+HERDR_GONE_TICKS = 3
+
+
+def herdr_failures_path():
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return pathlib.Path(base) / "omarchy-sessions" / "herdr-failures"
+
+
+def read_herdr_failures():
+    """How many reconciles in a row found no Herdr server. Lives in the
+    runtime directory, so a reboot starts the count over."""
+    with contextlib.suppress(OSError, ValueError):
+        return int(herdr_failures_path().read_text(encoding="utf-8").strip() or 0)
+    return 0
+
+
+def write_herdr_failures(count):
+    with contextlib.suppress(OSError):
+        path = herdr_failures_path()
+        if count <= 0:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(count), encoding="utf-8")
 
 
 def presence_dir(session_id):
@@ -4140,11 +4178,26 @@ def cmd_reconcile(args, ctx):
     try:
         live_panes = ctx.herdr.pane_list() or []
         live_agents = ctx.herdr.agent_list() or []
-    except HerdrUnavailable:
+    except HerdrUnavailable as e:
         # No server at all (typically right after a reboot): every bound,
         # live session lost its pane. Orphan them so the panel stops
         # showing a runtime that is gone and `open` can revive them, then
         # report the outage with exit 4 as the command contract says.
+        # Only when the socket is really gone, and only once it has been
+        # gone for HERDR_GONE_TICKS reconciles in a row: a timeout while
+        # the server is busy, or one tick between a server's exit and its
+        # restart, must not unbind every live session (xenolaptop,
+        # 2026-10-08). Until then nothing is written; the index's age
+        # tells the panel the reconciler is not getting through.
+        failures = read_herdr_failures() + 1 if e.gone else 0
+        write_herdr_failures(failures)
+        if not e.gone or failures < HERDR_GONE_TICKS:
+            why = "slow or confused" if not e.gone else f"gone for {failures} of {HERDR_GONE_TICKS} ticks"
+            if args.json:
+                print(json.dumps({"orphaned": [], "adopted": [], "herdr": "unreachable", "detail": why}, indent=2))
+            else:
+                print(f"orphaned 0, adopted 0 (Herdr unreachable: {why})")
+            raise
         orphaned = []
         for s in known:
             if s.get("runtime") is None or s["status"]["state"] in TERMINAL_STATES:
@@ -4165,6 +4218,7 @@ def cmd_reconcile(args, ctx):
         else:
             print(f"orphaned {len(orphaned)}, adopted 0 (Herdr unreachable)")
         raise
+    write_herdr_failures(0)
     live_agent_ids = {a.get("agent_id") for a in live_agents if a.get("agent_id")}
     live_pane_ids = {p.get("pane_id") for p in live_panes if p.get("pane_id")}
 
