@@ -13,7 +13,8 @@ set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 bindir=${OMARCHY_AGENT_SESSIONS_BINDIR:-$HOME/.local/bin}
 unitdir=$HOME/.config/systemd/user
-units=(omarchy-agent-session-watch.service omarchy-agent-session-herdr.service)
+units=(omarchy-agent-session-prune.timer omarchy-agent-session-prune.service
+       omarchy-agent-session-watch.service omarchy-agent-session-herdr.service)
 
 say() { printf '%s\n' "$*"; }
 

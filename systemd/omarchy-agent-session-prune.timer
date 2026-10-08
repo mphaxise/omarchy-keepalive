@@ -1,0 +1,15 @@
+# omarchy-agent-session-prune.timer (Agent Sessions for Omarchy, omarchy-multiplayer)
+#
+# Runs the prune once a day at 20:00 local time; Persistent catches up a
+# day the machine was asleep at that hour. Opt in with
+# OMARCHY_AGENT_SESSIONS_PRUNE=1 at install time, or
+# `systemctl --user enable --now omarchy-agent-session-prune.timer`.
+[Unit]
+Description=Daily prune of ended agent session records
+
+[Timer]
+OnCalendar=*-*-* 20:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

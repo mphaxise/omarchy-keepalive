@@ -1778,6 +1778,39 @@ class TestInvariant6(CoreTestCase):
         core.check_invariant6(self.store, hand_ws, new_session_created_by_session=False)  # must not raise
 
 
+class TestPruneTimerUnits(unittest.TestCase):
+    """The daily prune is the one scheduled deletion: its units say what
+    they run, and install.sh installs them without enabling."""
+
+    SYSTEMD = CORE_DIR / "systemd"
+
+    def test_prune_service_runs_the_prune_command_with_yes(self):
+        text = (self.SYSTEMD / "omarchy-agent-session-prune.service").read_text(encoding="utf-8")
+        self.assertIn("Type=oneshot", text)
+        self.assertIn("ExecStart=%h/.local/bin/omarchy-agent-session-prune --older-than 14d --yes", text)
+        self.assertIn("omarchy-multiplayer", text)   # the marker install.sh and uninstall.sh look for
+
+    def test_prune_timer_is_daily_at_eight_in_the_evening_and_persistent(self):
+        text = (self.SYSTEMD / "omarchy-agent-session-prune.timer").read_text(encoding="utf-8")
+        self.assertIn("OnCalendar=*-*-* 20:00:00", text)
+        self.assertIn("Persistent=true", text)
+        self.assertIn("WantedBy=timers.target", text)
+        self.assertIn("omarchy-multiplayer", text)
+
+    def test_install_script_enables_the_timer_only_when_asked(self):
+        install = (CORE_DIR / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("omarchy-agent-session-prune.timer", install)
+        self.assertIn("OMARCHY_AGENT_SESSIONS_PRUNE", install)
+        enable_lines = [l.strip() for l in install.splitlines()
+                        if l.strip().startswith("systemctl") and "enable --now" in l and "prune" in l]
+        self.assertEqual(enable_lines, ["systemctl --user enable --now omarchy-agent-session-prune.timer"])
+        # The unconditional enable covers the two always-on units only.
+        self.assertIn('systemctl --user enable --now "${units[@]}"', install)
+        self.assertNotIn("prune", install.split("units=(")[1].split(")")[0])
+        uninstall = (CORE_DIR / "uninstall.sh").read_text(encoding="utf-8")
+        self.assertIn("omarchy-agent-session-prune.timer", uninstall)
+
+
 class TestNoDeleteCommand(unittest.TestCase):
     def test_prune_is_the_only_deletion_and_needs_yes(self):
         # Invariant 7 (2026-09-03): deleting a session directory is the only

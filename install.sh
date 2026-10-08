@@ -6,7 +6,10 @@
 #
 #   ~/.config/omarchy/plugins/<id>/install.sh
 #
-# Environment: OMARCHY_AGENT_SESSIONS_BINDIR (default ~/.local/bin).
+# Environment: OMARCHY_AGENT_SESSIONS_BINDIR (default ~/.local/bin);
+# OMARCHY_AGENT_SESSIONS_PRUNE=1 also enables the daily prune timer, which
+# deletes ended session records older than fourteen days (off by default:
+# the records are yours, and this is the one thing in Keepalive that deletes).
 
 set -euo pipefail
 
@@ -14,6 +17,7 @@ here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 bindir=${OMARCHY_AGENT_SESSIONS_BINDIR:-$HOME/.local/bin}
 unitdir=$HOME/.config/systemd/user
 units=(omarchy-agent-session-herdr.service omarchy-agent-session-watch.service)
+prune_units=(omarchy-agent-session-prune.service omarchy-agent-session-prune.timer)
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -67,7 +71,7 @@ esac
 # ---- user units ----------------------------------------------------------
 
 mkdir -p "$unitdir"
-for unit in "${units[@]}"; do
+for unit in "${units[@]}" "${prune_units[@]}"; do
   src="$here/systemd/$unit"
   dst="$unitdir/$unit"
   [[ -f $src ]] || fail "missing $src"
@@ -81,6 +85,13 @@ done
 systemctl --user daemon-reload
 systemctl --user enable --now "${units[@]}"
 say "enabled ${units[*]}"
+if [[ ${OMARCHY_AGENT_SESSIONS_PRUNE:-0} == 1 ]]; then
+  systemctl --user enable --now omarchy-agent-session-prune.timer
+  say "enabled omarchy-agent-session-prune.timer (ended records older than 14 days go, daily at 20:00)"
+else
+  say "installed omarchy-agent-session-prune.timer, not enabled: it deletes ended records older than 14 days;"
+  say "  enable it with: systemctl --user enable --now omarchy-agent-session-prune.timer"
+fi
 
 # ---- what is left to you -------------------------------------------------
 

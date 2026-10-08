@@ -1,0 +1,16 @@
+# omarchy-agent-session-prune.service (Agent Sessions for Omarchy, omarchy-multiplayer)
+#
+# The one deletion in the model, on a schedule: ended session records older
+# than fourteen days go, with their receipts and transcripts of the record
+# (never the harness's own transcript, which is Claude's). Live, orphaned
+# and paused sessions are never touched (cmd_prune, 02-command-surface.md).
+#
+# Started by omarchy-agent-session-prune.timer. install.sh installs both
+# units but enables the timer only when asked (OMARCHY_AGENT_SESSIONS_PRUNE=1),
+# because this deletes; see the README.
+[Unit]
+Description=Prune ended agent session records older than 14 days
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omarchy-agent-session-prune --older-than 14d --yes
